@@ -14,7 +14,9 @@ model:
   
   num_classes: 6
   voting_strategy: "soft"  # Options: soft, hard
-  
+  dropout_rate: 0.3
+  max_length: 128
+
 training:
   # Ensemble training strategy
   strategy: "individual"  # Options: individual, joint

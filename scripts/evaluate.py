@@ -157,28 +157,36 @@ def load_model_and_config(model_path: str, config_path: str = None):
 def load_test_data(config, data_path: str = None, use_validation: bool = False):
     """Load test data for evaluation."""
     data_loader = EmotionDataLoader(config.paths.data_dir)
-    
+
+    # Prefer explicit data_path if provided
     if data_path:
-        # Load specific data file
         df = data_loader.load_csv_data(data_path)
         df = data_loader.validate_data(df, config.data.text_column, config.data.label_column)
         logger.info(f"Loaded test data from: {data_path}")
-    else:
-        # Try to load existing splits
-        splits = data_loader.load_splits()
-        
-        if use_validation and 'validation' in splits:
-            df = splits['validation']
-            logger.info("Using validation split for evaluation")
-        elif 'test' in splits:
-            df = splits['test']
-            logger.info("Using test split for evaluation")
-        else:
-            raise FileNotFoundError(
-                "No test data found. Please specify --data-path or ensure data splits exist"
-            )
-    
-    return data_loader, df
+        return data_loader, df
+
+    # Try to load from splits directory
+    splits_dir = Path(config.paths.data_dir) / "splits"
+    split_file = splits_dir / ("validation.csv" if use_validation else "test.csv")
+    if split_file.exists():
+        df = data_loader.load_csv_data(str(split_file))
+        df = data_loader.validate_data(df, config.data.text_column, config.data.label_column)
+        logger.info(f"Loaded test data from: {split_file}")
+        return data_loader, df
+
+    # Fallback: try to load from raw data
+    raw_dir = Path(config.paths.data_dir) / "raw"
+    for fname in ["emotions.csv", "sample_emotions.csv"]:
+        raw_file = raw_dir / fname
+        if raw_file.exists():
+            df = data_loader.load_csv_data(str(raw_file))
+            df = data_loader.validate_data(df, config.data.text_column, config.data.label_column)
+            logger.info(f"Loaded test data from: {raw_file}")
+            return data_loader, df
+
+    raise FileNotFoundError(
+        "No test/validation data found. Please specify --data-path or ensure data/splits or data/raw contains a CSV."
+    )
 
 def create_test_dataset(config, data_loader, test_df):
     """Create test dataset."""

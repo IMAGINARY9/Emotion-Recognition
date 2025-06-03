@@ -17,18 +17,25 @@ from transformers import AutoModel, AutoConfig, AutoTokenizer
 from typing import Dict, List, Optional, Tuple, Union
 import numpy as np
 from sklearn.metrics import accuracy_score, classification_report
+from torch.nn.utils.rnn import pad_sequence
 
 class EmotionDataset(Dataset):
     """Dataset class for emotion recognition."""
     
-    def __init__(self, texts: List[str], labels: List[int], tokenizer=None, max_length: int = 128):
+    def __init__(self, texts: List[str], labels: List[int], tokenizer=None, max_length: int = 128, vocab=None):
         self.texts = texts
         self.labels = labels
         self.tokenizer = tokenizer
         self.max_length = max_length
+        self.vocab = vocab or {}
         
     def __len__(self):
         return len(self.texts)
+    
+    def text_to_ids(self, text: str) -> List[int]:
+        """Convert text to list of token IDs for traditional models."""
+        tokens = text.lower().split()
+        return [self.vocab.get(token, 0) for token in tokens[:self.max_length]]
     
     def __getitem__(self, idx):
         text = str(self.texts[idx])
@@ -51,9 +58,31 @@ class EmotionDataset(Dataset):
         else:
             # For traditional models, return text and label
             return {
-                'text': text,
+                'input_ids': torch.tensor(self.text_to_ids(text), dtype=torch.long),
                 'label': torch.tensor(label, dtype=torch.long)
             }
+    
+    def get_collate_fn(self):
+        """Return a collate function that pads input_ids for traditional models."""
+        if self.tokenizer:
+            return None  # Use default collate for transformers
+        def collate_fn(batch):
+            # Pad input_ids to max_length
+            input_ids = [item['input_ids'] for item in batch]
+            labels = [item['label'] for item in batch]
+            # Pad sequences
+            padded = torch.nn.utils.rnn.pad_sequence(
+                input_ids, batch_first=True, padding_value=0
+            )
+            # Truncate or pad to max_length
+            if padded.size(1) > self.max_length:
+                padded = padded[:, :self.max_length]
+            elif padded.size(1) < self.max_length:
+                pad_width = self.max_length - padded.size(1)
+                padded = torch.nn.functional.pad(padded, (0, pad_width), value=0)
+            labels = torch.stack(labels)
+            return {'input_ids': padded, 'label': labels}
+        return collate_fn
 
 class DistilBERTEmotionModel(nn.Module):
     """

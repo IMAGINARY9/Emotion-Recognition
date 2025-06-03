@@ -54,14 +54,7 @@ class EmotionDataLoader:
                      label_col: str = 'label') -> pd.DataFrame:
         """
         Validate and clean the dataset.
-        
-        Args:
-            df: Input DataFrame
-            text_col: Name of text column
-            label_col: Name of label column
-            
-        Returns:
-            Validated DataFrame
+        Accepts both string and integer labels, mapping integers to emotion names if needed.
         """
         logger.info("Validating dataset...")
         
@@ -78,6 +71,12 @@ class EmotionDataLoader:
         
         if len(df) < initial_len:
             logger.warning(f"Removed {initial_len - len(df)} empty/null samples")
+        
+        # Map integer labels to emotion names if needed
+        if np.issubdtype(df[label_col].dtype, np.integer):
+            logger.info("Detected integer labels, mapping to emotion names.")
+            int_to_emotion = dict(enumerate(self.emotion_labels))
+            df[label_col] = df[label_col].map(int_to_emotion)
         
         # Validate labels
         valid_labels = set(self.emotion_labels)
@@ -271,14 +270,16 @@ class EmotionDataLoader:
         data_loaders = {}
         
         for split_name, dataset in datasets.items():
+            # Use custom collate_fn if available (for BiLSTM/traditional models)
+            collate_fn = getattr(dataset, 'get_collate_fn', lambda: None)()
             data_loaders[split_name] = DataLoader(
                 dataset,
                 batch_size=batch_sizes.get(split_name, 32),
                 shuffle=shuffle.get(split_name, False),
                 num_workers=num_workers,
-                pin_memory=torch.cuda.is_available()
+                pin_memory=torch.cuda.is_available(),
+                collate_fn=collate_fn
             )
-            
             logger.info(f"Created {split_name} DataLoader: "
                        f"batch_size={batch_sizes.get(split_name, 32)}, "
                        f"shuffle={shuffle.get(split_name, False)}")

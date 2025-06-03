@@ -81,7 +81,7 @@ class EmotionPreprocessor:
         # Social media patterns
         self.url_pattern = re.compile(r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+')
         self.mention_pattern = re.compile(r'@\w+')
-        self.hashtag_pattern = re.compile(r'#\w+')
+        self.hashtag_pattern = re.compile(r'#(\w+)')
         self.repeated_char_pattern = re.compile(r'(.)\1{2,}')
         
     def preprocess_text(self, text: str) -> str:
@@ -262,7 +262,7 @@ class EmotionPreprocessor:
         Returns:
             Preprocessed dataframe
         """
-        print(f"📚 Processing {dataset_name} dataset...")
+        print(f"Processing {dataset_name} dataset...")
         print(f"   Original size: {len(df)} rows")
         
         # Create a copy of the dataframe
@@ -306,15 +306,19 @@ class EmotionPreprocessor:
         # Emotion distribution
         emotion_counts = df[label_column].value_counts().sort_index()
         stats['emotion_distribution'] = {}
-        
+
         for idx, count in emotion_counts.items():
-            if idx < len(emotion_names):
+            if isinstance(idx, int) and idx < len(emotion_names):
                 emotion_name = emotion_names[idx]
-                percentage = (count / len(df)) * 100
-                stats['emotion_distribution'][emotion_name] = {
-                    'count': count,
-                    'percentage': percentage
-                }
+            elif isinstance(idx, str) and idx in emotion_names:
+                emotion_name = idx
+            else:
+                emotion_name = str(idx)
+            percentage = (count / len(df)) * 100
+            stats['emotion_distribution'][emotion_name] = {
+                'count': count,
+                'percentage': percentage
+            }
         
         # Text length statistics
         text_lengths = df['clean_text'].str.len()
@@ -349,16 +353,19 @@ class EmotionPreprocessor:
             emotion_names: List of emotion names
             num_examples: Number of examples to show
         """
-        print(f"\n💡 Preprocessing Examples:\n")
+        print(f"\nPreprocessing Examples:\n")
         
         for i in range(min(num_examples, len(df))):
             row = df.iloc[i]
             emotion_idx = row['label'] if 'label' in row else row.get('emotion', 0)
-            emotion_name = emotion_names[emotion_idx] if emotion_idx < len(emotion_names) else f"Emotion {emotion_idx}"
-            
+            if isinstance(emotion_idx, int) and emotion_idx < len(emotion_names):
+                emotion_name = emotion_names[emotion_idx]
+            elif isinstance(emotion_idx, str) and emotion_idx in emotion_names:
+                emotion_name = emotion_idx
+            else:
+                emotion_name = f"Emotion {emotion_idx}"
             original_text = row[text_column][:100] + "..." if len(row[text_column]) > 100 else row[text_column]
             cleaned_text = row['clean_text'][:100] + "..." if len(row['clean_text']) > 100 else row['clean_text']
-            
             print(f"   Example {i+1}:")
             print(f"   Original:  {original_text}")
             print(f"   Cleaned:   {cleaned_text}")
@@ -404,7 +411,7 @@ class EmotionDataProcessor:
         )
         
         # Show statistics
-        print("\n📊 Dataset Statistics:")
+        print("\nDataset Statistics:")
         for name, df in [("Training", train_processed), ("Validation", val_processed), ("Test", test_processed)]:
             stats = self.preprocessor.get_emotion_statistics(df, label_column, self.emotion_names)
             print(f"\n{name} Set:")

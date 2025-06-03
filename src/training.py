@@ -41,7 +41,8 @@ class EmotionTrainer:
                  warmup_steps: int = 100,
                  gradient_clipping: float = 1.0,
                  save_dir: str = 'models',
-                 emotion_names: List[str] = None):
+                 emotion_names: List[str] = None,
+                 class_weights: torch.Tensor = None):
         """
         Initialize the trainer.
         
@@ -55,6 +56,7 @@ class EmotionTrainer:
             gradient_clipping: Maximum gradient norm for clipping
             save_dir: Directory to save models
             emotion_names: List of emotion names
+            class_weights: Tensor of class weights for imbalanced data
         """
         self.model = model.to(device)
         self.tokenizer = tokenizer
@@ -67,6 +69,7 @@ class EmotionTrainer:
         self.save_dir.mkdir(exist_ok=True)
         
         self.emotion_names = emotion_names or ['sadness', 'joy', 'love', 'anger', 'fear', 'surprise']
+        self.class_weights = class_weights
         
         # Training history
         self.history = {
@@ -120,10 +123,11 @@ class EmotionTrainer:
         # Create datasets
         train_dataset = EmotionDataset(train_texts, train_labels, self.tokenizer, max_length)
         val_dataset = EmotionDataset(val_texts, val_labels, self.tokenizer, max_length)
-        
-        # Create data loaders
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
-        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+        # Use custom collate_fn if available (for BiLSTM/traditional models)
+        train_collate_fn = getattr(train_dataset, 'get_collate_fn', lambda: None)()
+        val_collate_fn = getattr(val_dataset, 'get_collate_fn', lambda: None)()
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0, collate_fn=train_collate_fn)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=0, collate_fn=val_collate_fn)
         
         return train_loader, val_loader
     
@@ -163,7 +167,12 @@ class EmotionTrainer:
                 
                 outputs = self.model(input_ids=input_ids, labels=labels)
             
-            loss = outputs['loss']
+            # Use class weights if available
+            if self.class_weights is not None:
+                loss_fct = nn.CrossEntropyLoss(weight=self.class_weights)
+                loss = loss_fct(outputs['logits'], labels)
+            else:
+                loss = outputs['loss']
             logits = outputs['logits']
             
             # Backward pass
@@ -220,15 +229,17 @@ class EmotionTrainer:
                     input_ids = batch['input_ids'].to(self.device)
                     attention_mask = batch['attention_mask'].to(self.device)
                     labels = batch['label'].to(self.device)
-                    
                     outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
                 else:
                     input_ids = batch['input_ids'].to(self.device)
                     labels = batch['label'].to(self.device)
-                    
                     outputs = self.model(input_ids=input_ids, labels=labels)
-                
-                loss = outputs['loss']
+                # Use class weights if available
+                if self.class_weights is not None:
+                    loss_fct = nn.CrossEntropyLoss(weight=self.class_weights)
+                    loss = loss_fct(outputs['logits'], labels)
+                else:
+                    loss = outputs['loss']
                 logits = outputs['logits']
                 
                 total_loss += loss.item()

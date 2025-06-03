@@ -160,8 +160,7 @@ class ConfigManager:
         Returns:
             Model configuration
         """
-        config_file = f"{model_type}_config.yaml"
-        config_path = self.config_dir / config_file
+        config_path = self.config_dir / model_type
         
         return self.load_config(config_path)
     
@@ -206,16 +205,15 @@ class ConfigManager:
         if 'num_classes' not in config.model:
             raise ValueError("Number of classes not specified")
         
-        # Validate training config
-        if config.training.batch_size <= 0:
+        # Validate training config        
+        if int(config.training.batch_size) <= 0:
             raise ValueError("Batch size must be positive")
         
-        if config.training.learning_rate <= 0:
+        if float(config.training.learning_rate) <= 0:
             raise ValueError("Learning rate must be positive")
         
-        if config.training.num_epochs <= 0:
+        if int(config.training.num_epochs) <= 0:
             raise ValueError("Number of epochs must be positive")
-        
         # Validate data splits
         total_split = config.data.train_split + config.data.val_split + config.data.test_split
         if abs(total_split - 1.0) > 1e-6:
