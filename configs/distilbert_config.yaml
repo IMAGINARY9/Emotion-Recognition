@@ -1,0 +1,106 @@
+# Configuration for DistilBERT-based emotion recognition model
+
+model:
+  type: "distilbert"
+  model_name: "distilbert-base-uncased"
+  num_classes: 6
+  dropout_rate: 0.3
+  max_length: 128
+  
+training:
+  batch_size: 32
+  learning_rate: 2e-5
+  num_epochs: 10
+  warmup_steps: 500
+  weight_decay: 0.01
+  gradient_clip_norm: 1.0
+  
+  # Learning rate scheduler
+  scheduler:
+    type: "cosine"  # Options: linear, cosine, polynomial
+    warmup_ratio: 0.1
+  
+  # Early stopping
+  early_stopping:
+    enabled: true
+    patience: 3
+    min_delta: 0.001
+    metric: "val_f1"
+    mode: "max"
+
+data:
+  max_length: 128
+  text_column: "text"
+  label_column: "label"
+  train_split: 0.8
+  val_split: 0.1
+  test_split: 0.1
+  
+  # Data loading
+  batch_sizes:
+    train: 32
+    validation: 64
+    test: 64
+  
+  shuffle:
+    train: true
+    validation: false
+    test: false
+  
+  num_workers: 0
+
+preprocessing:
+  # Text preprocessing options
+  lowercase: true
+  remove_urls: true
+  remove_mentions: true
+  remove_hashtags: false
+  remove_extra_whitespace: true
+  remove_stopwords: false
+  expand_contractions: true
+  
+  # Emoji handling
+  emoji_handling: "convert"  # Options: remove, convert, keep
+  
+  # Special tokens
+  add_special_tokens: true
+
+evaluation:
+  metrics:
+    - "accuracy"
+    - "f1_macro"
+    - "f1_weighted"
+    - "precision_macro" 
+    - "recall_macro"
+    - "roc_auc"
+  
+  # Visualization options
+  plot_confusion_matrix: true
+  plot_training_history: true
+  plot_embeddings: true
+  save_predictions: true
+
+paths:
+  data_dir: "data"
+  model_dir: "models"
+  output_dir: "outputs"
+  log_dir: "logs"
+  cache_dir: "cache"
+  
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  
+device:
+  # Auto-detect device or specify manually
+  auto_detect: true
+  force_cpu: false
+  
+# Emotion labels (must match dataset)
+emotions:
+  - "sadness"
+  - "joy"
+  - "love"
+  - "anger"
+  - "fear"
+  - "surprise"

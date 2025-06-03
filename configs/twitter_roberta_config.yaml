@@ -1,0 +1,108 @@
+# Configuration for Twitter RoBERTa-based emotion recognition model
+
+model:
+  type: "twitter_roberta"
+  model_name: "cardiffnlp/twitter-roberta-base-emotion"
+  num_classes: 6
+  dropout_rate: 0.2
+  max_length: 128
+  freeze_base: false
+  
+training:
+  batch_size: 16  # Smaller batch size for larger model
+  learning_rate: 1e-5  # Lower learning rate for pre-trained model
+  num_epochs: 8
+  warmup_steps: 300
+  weight_decay: 0.01
+  gradient_clip_norm: 1.0
+  accumulation_steps: 2  # Gradient accumulation
+  
+  # Learning rate scheduler
+  scheduler:
+    type: "linear"
+    warmup_ratio: 0.1
+  
+  # Early stopping
+  early_stopping:
+    enabled: true
+    patience: 2
+    min_delta: 0.001
+    metric: "val_f1"
+    mode: "max"
+
+data:
+  max_length: 128
+  text_column: "text"
+  label_column: "label"
+  train_split: 0.8
+  val_split: 0.1
+  test_split: 0.1
+  
+  # Data loading
+  batch_sizes:
+    train: 16
+    validation: 32
+    test: 32
+  
+  shuffle:
+    train: true
+    validation: false
+    test: false
+  
+  num_workers: 0
+
+preprocessing:
+  # Text preprocessing options (lighter for Twitter model)
+  lowercase: false  # Keep original case for Twitter model
+  remove_urls: false  # Keep URLs as they may carry sentiment
+  remove_mentions: false  # Keep mentions
+  remove_hashtags: false  # Keep hashtags
+  remove_extra_whitespace: true
+  remove_stopwords: false
+  expand_contractions: false  # Keep contractions as they appear in tweets
+  
+  # Emoji handling
+  emoji_handling: "keep"  # Keep emojis for Twitter model
+  
+  # Special tokens
+  add_special_tokens: true
+
+evaluation:
+  metrics:
+    - "accuracy"
+    - "f1_macro"
+    - "f1_weighted"
+    - "precision_macro"
+    - "recall_macro" 
+    - "roc_auc"
+  
+  # Visualization options
+  plot_confusion_matrix: true
+  plot_training_history: true
+  plot_embeddings: true
+  save_predictions: true
+
+paths:
+  data_dir: "data"
+  model_dir: "models"
+  output_dir: "outputs"
+  log_dir: "logs"
+  cache_dir: "cache"
+  
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  
+device:
+  # Auto-detect device or specify manually
+  auto_detect: true
+  force_cpu: false
+  
+# Emotion labels (must match dataset)
+emotions:
+  - "sadness"
+  - "joy"
+  - "love"
+  - "anger"
+  - "fear"
+  - "surprise"

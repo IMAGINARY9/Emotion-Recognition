@@ -1,0 +1,56 @@
+# Emotion Recognition Requirements
+
+# Core ML/AI frameworks
+torch>=2.0.0
+torchtext>=0.15.0
+transformers>=4.30.0
+datasets>=2.12.0
+accelerate>=0.20.0
+
+# Data processing
+pandas>=2.0.0
+numpy>=1.24.0
+scikit-learn>=1.3.0
+scipy>=1.10.0
+
+# Text processing and NLP
+nltk>=3.8.0
+spacy>=3.6.0
+emoji>=2.5.0
+contractions>=0.1.73
+wordcloud>=1.9.0
+textblob>=0.17.1
+vaderSentiment>=3.3.2
+omegaconf>=2.2.3
+
+# Visualization
+matplotlib>=3.7.0
+seaborn>=0.12.0
+plotly>=5.14.0
+panel>=1.0.0
+
+# Configuration and utilities
+PyYAML>=6.0
+tqdm>=4.65.0
+colorama>=0.4.6
+pathlib2>=2.3.7
+
+# Jupyter and development
+jupyter>=1.0.0
+ipywidgets>=8.0.0
+notebook>=6.5.0
+
+# Model tracking and logging
+wandb>=0.15.0
+tensorboard>=2.13.0
+
+# Performance and optimization
+psutil>=5.9.0
+memory-profiler>=0.60.0
+
+# Testing
+pytest>=7.3.0
+pytest-cov>=4.1.0
+
+# CUDA support (optional)
+# torch-audio>=2.0.0  # Uncomment if audio processing needed
