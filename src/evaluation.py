@@ -122,7 +122,8 @@ class EmotionEvaluator:
         """
         # Create dataset and dataloader
         dataset = EmotionDataset(texts, labels, self.tokenizer, max_length)
-        dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=False)
+        collate_fn = getattr(dataset, 'get_collate_fn', lambda: None)()
+        dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
         
         all_predictions = []
         all_probabilities = []
@@ -215,8 +216,8 @@ class EmotionEvaluator:
         for i, confidence in wrong_confidences[:10]:  # Top 10
             error_analysis['most_confident_errors'].append({
                 'text': texts[i][:100] + "..." if len(texts[i]) > 100 else texts[i],
-                'true_emotion': self.emotion_names[labels[i]],
-                'predicted_emotion': self.emotion_names[predictions[i]],
+                'true_emotion': self.emotion_names[int(labels[i])],
+                'predicted_emotion': self.emotion_names[int(predictions[i])],
                 'confidence': confidence
             })
         
@@ -338,6 +339,9 @@ class EmotionEvaluator:
         
         # Extract embeddings
         embeddings = self._extract_embeddings(texts)
+        if embeddings.size == 0:
+            self.logger.warning("No embeddings extracted; skipping embedding visualization.")
+            return
         
         # Apply t-SNE
         scaler = MinMaxScaler()
@@ -433,7 +437,7 @@ class EmotionEvaluator:
             'model_name': model_name,
             'evaluation_timestamp': timestamp,
             'dataset_size': len(test_texts),
-            'emotion_names': self.emotion_names,
+            'emotion_names': list(self.emotion_names),
             'metrics': {
                 'accuracy': float(metrics['accuracy']),
                 'precision': float(metrics['precision']),
@@ -441,24 +445,35 @@ class EmotionEvaluator:
                 'f1': float(metrics['f1']),
                 'macro_f1': float(metrics['macro_f1']),
                 'micro_f1': float(metrics['micro_f1']),
-                'auc_ovr': float(metrics['auc_ovr']) if metrics['auc_ovr'] else None,
-                'auc_ovo': float(metrics['auc_ovo']) if metrics['auc_ovo'] else None
+                'auc_ovr': float(metrics['auc_ovr']) if metrics['auc_ovr'] is not None else None,
+                'auc_ovo': float(metrics['auc_ovo']) if metrics['auc_ovo'] is not None else None
             },
             'per_class_metrics': {
-                emotion: {
+                str(emotion): {
                     'precision': float(metrics['per_class_precision'][i]),
                     'recall': float(metrics['per_class_recall'][i]),
                     'f1': float(metrics['per_class_f1'][i])
                 }
-                for i, emotion in enumerate(self.emotion_names)
+                for i, emotion in enumerate(list(self.emotion_names))
             },
             'error_analysis': metrics['error_analysis'],
             'classification_report': metrics['classification_report']
         }
         
+        def to_serializable(obj):
+            import numpy as np
+            if isinstance(obj, dict):
+                return {k: to_serializable(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [to_serializable(v) for v in obj]
+            elif isinstance(obj, np.generic):
+                return obj.item()
+            else:
+                return obj
+        
         # Save report
         with open(report_path, 'w', encoding='utf-8') as f:
-            json.dump(report_data, f, indent=2, ensure_ascii=False)
+            json.dump(to_serializable(report_data), f, indent=2, ensure_ascii=False)
         
         self.logger.info(f"Evaluation report saved to {report_path}")
         

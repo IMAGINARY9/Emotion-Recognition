@@ -4,6 +4,7 @@ Evaluation script for emotion recognition models.
 
 This script provides a command-line interface for evaluating trained
 emotion recognition models on test data.
+
 """
 
 import argparse
@@ -14,15 +15,16 @@ import logging
 import torch
 import pandas as pd
 import json
+import yaml
 
 # Add src to path
 sys.path.append(str(Path(__file__).parent.parent / "src"))
 
-from config import ConfigManager, setup_logging, get_device_config
-from data_utils import EmotionDataLoader
-from preprocessing import EmotionPreprocessor, EmotionDataProcessor
-from models import create_model
-from evaluation import EmotionEvaluator
+from src.config import ConfigManager, setup_logging, get_device_config
+from src.data_utils import EmotionDataLoader
+from src.preprocessing import EmotionPreprocessor, EmotionDataProcessor
+from src.models import create_model, EmotionDataset  # Import EmotionDataset here
+from src.evaluation import EmotionEvaluator
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +66,7 @@ def parse_args():
     parser.add_argument(
         "--output-dir",
         type=str,
-        default="evaluation_results",
+        default="evaluations",
         help="Output directory for evaluation results"
     )
     
@@ -134,14 +136,36 @@ def load_model_and_config(model_path: str, config_path: str = None):
         raise FileNotFoundError(f"Model checkpoint not found in {model_path}")
     
     # Create model
-    model = create_model(
-        model_type=config.model.type,
-        num_classes=config.model.num_classes,
-        model_name=config.model.get('model_name'),
-        dropout_rate=config.model.dropout_rate,
-        max_length=config.model.max_length,
-        **config.model
-    )
+    model_config = dict(config.model)
+    model_type = model_config.pop('type')
+
+    if model_type == 'ensemble':
+        submodels = []
+        for sub_cfg in model_config['models']:
+            sub_cfg = dict(sub_cfg)
+            sub_type = sub_cfg.pop('type')
+            # Normalize submodel type (replace underscores with dashes)
+            sub_type = sub_type.replace('_', '-')
+            # If BiLSTM, ensure vocab_size is present
+            if sub_type == 'bilstm' and 'vocab_size' not in sub_cfg:
+                with open('configs/bilstm_config.yaml', 'r') as f:
+                    default_bilstm_cfg = yaml.safe_load(f)
+                sub_cfg['vocab_size'] = default_bilstm_cfg['model']['vocab_size']
+            # Remove keys not valid for submodel
+            for k in ['weight']:
+                sub_cfg.pop(k, None)
+            submodel = create_model(model_type=sub_type, model_config=sub_cfg)
+            submodels.append(submodel)
+        weights = model_config.get('weights', [1.0/len(submodels)]*len(submodels))
+        model = create_model(
+            model_type='ensemble',
+            model_config={'models': submodels, 'weights': weights}
+        )
+    else:
+        model = create_model(
+            model_type=model_type,
+            model_config=model_config
+        )
     
     # Load checkpoint
     checkpoint = torch.load(checkpoint_path, map_location='cpu')
@@ -192,29 +216,36 @@ def create_test_dataset(config, data_loader, test_df):
     """Create test dataset."""
     # Initialize preprocessor
     preprocessor = EmotionPreprocessor(
-        lowercase=config.preprocessing.lowercase,
-        remove_urls=config.preprocessing.remove_urls,
-        remove_mentions=config.preprocessing.remove_mentions,
-        remove_hashtags=config.preprocessing.remove_hashtags,
-        remove_extra_whitespace=config.preprocessing.remove_extra_whitespace,
-        remove_stopwords=config.preprocessing.remove_stopwords,
-        expand_contractions=config.preprocessing.expand_contractions,
-        emoji_handling=config.preprocessing.emoji_handling
+        normalize_case=getattr(config.preprocessing, 'lowercase', True),
+        handle_emojis=getattr(config.preprocessing, 'emoji_handling', 'convert'),
+        expand_contractions=getattr(config.preprocessing, 'expand_contractions', True),
+        remove_stopwords=getattr(config.preprocessing, 'remove_stopwords', False),
+        lemmatize=getattr(config.preprocessing, 'lemmatize', False),
+        handle_social_media=getattr(config.preprocessing, 'handle_social_media', True),
+        min_length=getattr(config.preprocessing, 'min_length', 3),
+        max_length=getattr(config.data, 'max_length', 128)
     )
     
     # Create data processor
     data_processor = EmotionDataProcessor(
-        preprocessor=preprocessor,
-        label_encoder=data_loader.label_encoder,
-        max_length=config.data.max_length
+        preprocessor=preprocessor
     )
     
-    # Create test dataset
-    test_dataset = data_processor.create_dataset(
-        test_df, config.data.text_column, config.data.label_column,
-        model_type=config.model.type, model_name=config.model.get('model_name')
+    # Preprocess test data
+    processed_test = data_processor.preprocessor.preprocess_dataset(
+        test_df, config.data.text_column, config.data.label_column
     )
-    
+    # Prepare for evaluation
+    test_texts, test_labels = data_processor.prepare_for_training(
+        processed_test, text_column='clean_text', label_column=config.data.label_column
+    )
+    test_labels = data_loader.label_encoder.transform(test_labels)
+    test_dataset = EmotionDataset(
+        texts=test_texts,
+        labels=test_labels,
+        tokenizer=None,
+        max_length=getattr(config.data, 'max_length', 128)
+    )
     return test_dataset, data_processor
 
 def run_evaluation(model, config, test_dataset, device: str, output_dir: str, args):
@@ -223,7 +254,7 @@ def run_evaluation(model, config, test_dataset, device: str, output_dir: str, ar
     evaluator = EmotionEvaluator(
         model=model,
         device=device,
-        emotion_labels=config.emotions
+        emotion_names=config.emotions
     )
     
     # Create data loader
@@ -235,17 +266,24 @@ def run_evaluation(model, config, test_dataset, device: str, output_dir: str, ar
     
     # Run evaluation
     logger.info("Running evaluation...")
-    results = evaluator.evaluate(test_loader)
+    test_texts = test_dataset.texts
+    test_labels = test_dataset.labels
+    results = evaluator.evaluate_model(
+        test_texts,
+        test_labels,
+        batch_size=args.batch_size,
+        max_length=getattr(config.data, 'max_length', 128)
+    )
     
     # Print results
     print("\n" + "="*50)
     print("EVALUATION RESULTS")
     print("="*50)
     print(f"Accuracy: {results['accuracy']:.4f}")
-    print(f"F1 Score (Macro): {results['f1_macro']:.4f}")
-    print(f"F1 Score (Weighted): {results['f1_weighted']:.4f}")
-    print(f"Precision (Macro): {results['precision_macro']:.4f}")
-    print(f"Recall (Macro): {results['recall_macro']:.4f}")
+    print(f"F1 Score (Macro): {results['macro_f1']:.4f}")
+    print(f"F1 Score (Weighted): {results['f1']:.4f}")
+    print(f"Precision (Macro): {results['precision']:.4f}")
+    print(f"Recall (Macro): {results['recall']:.4f}")
     
     if 'roc_auc' in results:
         print(f"ROC AUC: {results['roc_auc']:.4f}")
@@ -264,8 +302,9 @@ def run_evaluation(model, config, test_dataset, device: str, output_dir: str, ar
     output_dir.mkdir(parents=True, exist_ok=True)
     
     # Generate detailed report
-    report_path = output_dir / "evaluation_report.json"
-    evaluator.generate_report(results, str(report_path))
+    evaluator.generate_evaluation_report(
+        results, test_dataset.texts, test_dataset.labels, model_name=config.model.type
+    )
     
     # Save human-readable report
     text_report_path = output_dir / "evaluation_report.txt"
@@ -278,10 +317,10 @@ def run_evaluation(model, config, test_dataset, device: str, output_dir: str, ar
         
         f.write("OVERALL METRICS:\n")
         f.write(f"Accuracy: {results['accuracy']:.4f}\n")
-        f.write(f"F1 Score (Macro): {results['f1_macro']:.4f}\n")
-        f.write(f"F1 Score (Weighted): {results['f1_weighted']:.4f}\n")
-        f.write(f"Precision (Macro): {results['precision_macro']:.4f}\n")
-        f.write(f"Recall (Macro): {results['recall_macro']:.4f}\n")
+        f.write(f"F1 Score (Macro): {results['macro_f1']:.4f}\n")
+        f.write(f"F1 Score (Weighted): {results['f1']:.4f}\n")
+        f.write(f"Precision (Macro): {results['precision']:.4f}\n")
+        f.write(f"Recall (Macro): {results['recall']:.4f}\n")
         
         if 'roc_auc' in results:
             f.write(f"ROC AUC: {results['roc_auc']:.4f}\n")
@@ -298,10 +337,12 @@ def run_evaluation(model, config, test_dataset, device: str, output_dir: str, ar
         logger.info("Generating visualizations...")
         
         # Confusion matrix
-        evaluator.plot_confusion_matrix(results['confusion_matrix'], str(output_dir))
+        evaluator.plot_confusion_matrix(results['confusion_matrix'], str(Path(output_dir) / "confusion_matrix.png"))
         
         # Embeddings plot
-        evaluator.plot_embeddings(test_loader, str(output_dir))
+        evaluator.visualize_embeddings(
+            test_dataset.texts, test_dataset.labels, save_path=str(Path(output_dir) / "embeddings_tsne.png")
+        )
         
         # ROC curves if available
         if 'roc_curves' in results:
