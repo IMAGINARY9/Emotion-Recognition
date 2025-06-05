@@ -2,7 +2,7 @@
 
 model:
   type: "bilstm"
-  vocab_size: 10000
+  vocab_size: 12678
   embedding_dim: 300
   hidden_dim: 128
   num_layers: 2

@@ -280,28 +280,78 @@ class EnsembleEmotionModel(nn.Module):
     
     def __init__(self, models: List[nn.Module], weights: Optional[List[float]] = None):
         super().__init__()
-        
-        self.models = nn.ModuleList(models)
-        self.weights = weights if weights else [1.0 / len(models)] * len(models)
-        self.num_labels = models[0].num_labels if hasattr(models[0], 'num_labels') else 6
-        
+        # Only keep models that are not None (in case BiLSTM is removed from config)
+        self.models = nn.ModuleList([m for m in models if m is not None])
+        if weights is not None:
+            # Only keep weights for present models
+            if len(weights) != len(models):
+                print("[Ensemble Warning] Number of weights does not match number of models. Using equal weights.")
+                self.weights = [1.0 / len(self.models)] * len(self.models)
+            else:
+                total = sum(weights)
+                self.weights = [float(w) / total for w in weights]
+        else:
+            self.weights = [1.0 / len(self.models)] * len(self.models)
+    
     def forward(self, **inputs) -> Dict[str, torch.Tensor]:
         """Forward pass through ensemble."""
         logits_list = []
+        successful_indices = []
         
-        for model in self.models:
+        for i, model in enumerate(self.models):
             try:
-                outputs = model(**inputs)
+                # Robust mapping from model class to input key
+                model_name = type(model).__name__.lower()
+                # Accept both hyphen and underscore keys for robustness
+                if 'distilbert' in model_name:
+                    for key in ['distilbert', 'distilbert-emotion', 'distilbert_emotion']:
+                        if key in inputs:
+                            sub_inputs = inputs[key]
+                            outputs = model(**sub_inputs, labels=inputs['labels'])
+                            break
+                    else:
+                        raise ValueError(f"No matching input for model {model_name}. Available keys: {list(inputs.keys())}")
+                elif 'roberta' in model_name or 'twitterroberta' in model_name:
+                    for key in ['twitter-roberta', 'twitter_roberta', 'roberta', 'roberta-emotion', 'roberta_emotion']:
+                        if key in inputs:
+                            sub_inputs = inputs[key]
+                            outputs = model(**sub_inputs, labels=inputs['labels'])
+                            break
+                    else:
+                        raise ValueError(f"No matching input for model {model_name}. Available keys: {list(inputs.keys())}")
+                elif 'bilstm' in model_name:
+                    if 'bilstm' in inputs:
+                        sub_inputs = inputs['bilstm']
+                        outputs = model(**sub_inputs, labels=inputs['labels'])
+                    else:
+                        raise ValueError(f"No matching input for model {model_name}. Available keys: {list(inputs.keys())}")
+                else:
+                    raise ValueError(f"No matching input for model {model_name}. Available keys: {list(inputs.keys())}")
                 logits_list.append(outputs['logits'])
+                successful_indices.append(i)
             except Exception as e:
-                # Skip models that can't handle the input format
+                print(f"[Ensemble Warning] Model {i} failed: {e}")
                 continue
-                
+        
         if not logits_list:
             raise RuntimeError("No models in ensemble could process the inputs")
-            
+        
+        # Use only weights for successful models and renormalize
+        successful_weights = [self.weights[i] for i in successful_indices]
+        total_weight = sum(successful_weights)
+        normalized_weights = [w / total_weight for w in successful_weights]
+        
+        # Debug: print individual model predictions and logits
+        with torch.no_grad():
+            for i, (logits, weight) in enumerate(zip(logits_list, normalized_weights)):
+                preds = torch.argmax(logits, dim=-1)
+                sample_logits = logits[0] if logits.shape[0] > 0 else logits
+                print(f"[Ensemble Debug] Model {successful_indices[i]} predictions: {preds[:5]}, logits[0]: {sample_logits}, weight: {weight:.3f}")
+        
         # Weighted average of logits
-        weighted_logits = sum(w * logits for w, logits in zip(self.weights, logits_list))
+        weighted_logits = torch.zeros_like(logits_list[0])
+        for weight, logits in zip(normalized_weights, logits_list):
+            weighted_logits += weight * logits
         
         result = {'logits': weighted_logits}
         
@@ -309,7 +359,17 @@ class EnsembleEmotionModel(nn.Module):
             loss_fct = nn.CrossEntropyLoss()
             loss = loss_fct(weighted_logits, inputs['labels'])
             result['loss'] = loss
-            
+        
+        # Debug: check if all predictions are for a single class
+        with torch.no_grad():
+            preds = torch.argmax(weighted_logits, dim=-1)
+            unique = torch.unique(preds)
+            sample_weighted_logits = weighted_logits[0] if weighted_logits.shape[0] > 0 else weighted_logits
+            print(f"[Ensemble Debug] Final weighted logits[0]: {sample_weighted_logits}")
+            print(f"[Ensemble Debug] Final ensemble predictions: {preds[:5]}, unique classes: {unique}")
+            if unique.numel() == 1:
+                print(f"[Ensemble Warning] All ensemble predictions are for class {unique.item()} in this batch.")
+        
         return result
 
 class EmotionPredictor:

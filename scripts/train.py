@@ -15,6 +15,8 @@ import torch
 import pandas as pd
 from datetime import datetime
 import json
+import numpy as np
+from collections import Counter
 
 # Add src to path
 sys.path.append(str(Path(__file__).parent.parent / "src"))
@@ -223,9 +225,32 @@ def create_datasets(config, data_loader, train_df, val_df, test_df):
         train_df, val_df, test_df, text_column=config.data.text_column, label_column=config.data.label_column
     )
 
+    # --- BiLSTM-specific: Build vocab and tokenizer ---
+    use_bilstm = any(m['type'] == 'bilstm' for m in getattr(config.model, 'models', [])) or getattr(config.model, 'type', None) == 'bilstm'
+    bilstm_tokenizer = None
+    vocab = None
+    if use_bilstm:
+        from collections import Counter
+        # Build vocab from training data
+        train_texts = processed_train['clean_text'].tolist() if not processed_train.empty else []
+        tokens = [word for text in train_texts for word in text.split()]
+        vocab_counter = Counter(tokens)
+        vocab = {word: idx+2 for idx, (word, _) in enumerate(vocab_counter.most_common())}  # +2 for PAD/UNK
+        vocab['<PAD>'] = 0
+        vocab['<UNK>'] = 1
+        def bilstm_tokenizer_fn(text):
+            return [vocab.get(word, vocab['<UNK>']) for word in text.split()]
+        bilstm_tokenizer = bilstm_tokenizer_fn
+        # Set vocab_size in config for BiLSTM
+        if hasattr(config.model, 'models'):
+            for m in config.model.models:
+                if m['type'] == 'bilstm':
+                    m['vocab_size'] = len(vocab)
+        elif getattr(config.model, 'type', None) == 'bilstm':
+            config.model.vocab_size = len(vocab)
+
     # Prepare for training and create datasets
     datasets = {}
-    # Use label encoder for integer labels
     label_encoder = data_loader.label_encoder
     if not processed_train.empty:
         train_texts, train_labels = data_processor.prepare_for_training(
@@ -235,7 +260,7 @@ def create_datasets(config, data_loader, train_df, val_df, test_df):
         datasets['train'] = EmotionDataset(
             texts=train_texts,
             labels=train_labels,
-            tokenizer=None,  # Set tokenizer if needed for transformers
+            tokenizer=bilstm_tokenizer if use_bilstm else None,
             max_length=config.data.get('max_length', 128)
         )
     if not processed_val.empty:
@@ -246,7 +271,7 @@ def create_datasets(config, data_loader, train_df, val_df, test_df):
         datasets['validation'] = EmotionDataset(
             texts=val_texts,
             labels=val_labels,
-            tokenizer=None,
+            tokenizer=bilstm_tokenizer if use_bilstm else None,
             max_length=config.data.get('max_length', 128)
         )
     if not processed_test.empty:
@@ -257,7 +282,7 @@ def create_datasets(config, data_loader, train_df, val_df, test_df):
         datasets['test'] = EmotionDataset(
             texts=test_texts,
             labels=test_labels,
-            tokenizer=None,
+            tokenizer=bilstm_tokenizer if use_bilstm else None,
             max_length=config.data.get('max_length', 128)
         )
     return datasets, data_processor
@@ -267,48 +292,80 @@ def train_model(config, datasets, device: str, output_dir: str):
     # Create model
     # Prepare model config for ensemble
     if config.model.type == 'ensemble':
-        # Instantiate each submodel
-        submodels = []
+        strategy = getattr(config.training, 'strategy', 'joint')
         config_manager = ConfigManager()
-        for submodel_cfg in config.model.models:
-            submodel_type = submodel_cfg['type'].replace('_', '-')  # Normalize type for create_model
-            # Remove 'type', 'weight', 'max_length', and 'dropout_rate' from submodel config for instantiation
+        submodels = []
+        submodel_paths = []
+        # Prepare submodel configs
+        for i, submodel_cfg in enumerate(config.model.models):
+            submodel_type = submodel_cfg['type'].replace('_', '-')
             submodel_cfg_clean = {k: v for k, v in submodel_cfg.items() if k not in ('type', 'weight', 'max_length', 'dropout_rate')}
-            # Use defaults from top-level config if not present in submodel config
             if 'num_classes' not in submodel_cfg_clean and hasattr(config.model, 'num_classes'):
                 submodel_cfg_clean['num_classes'] = config.model.num_classes
             if 'dropout_rate' not in submodel_cfg_clean and hasattr(config.model, 'dropout_rate'):
                 submodel_cfg_clean['dropout_rate'] = config.model.dropout_rate
-            # Map num_classes to num_labels for model constructors
             if 'num_classes' in submodel_cfg_clean:
                 submodel_cfg_clean['num_labels'] = submodel_cfg_clean.pop('num_classes')
-            # Map dropout_rate to dropout for model constructors
             if 'dropout_rate' in submodel_cfg_clean:
                 submodel_cfg_clean['dropout'] = submodel_cfg_clean.pop('dropout_rate')
-            # Inject BiLSTM required params if missing, using bilstm config file as fallback
+            # BiLSTM fallback params
             if submodel_type == 'bilstm':
-                # Load bilstm config file
                 bilstm_config = config_manager.load_config('configs/bilstm_config.yaml')
                 bilstm_model_cfg = bilstm_config['model']
                 for param in ['vocab_size', 'embedding_dim', 'hidden_dim', 'num_layers']:
                     if param not in submodel_cfg_clean and param in bilstm_model_cfg:
                         submodel_cfg_clean[param] = bilstm_model_cfg[param]
-                # num_labels for BiLSTM
                 if 'num_labels' not in submodel_cfg_clean:
                     if 'num_classes' in bilstm_model_cfg:
                         submodel_cfg_clean['num_labels'] = bilstm_model_cfg['num_classes']
                     elif hasattr(config.model, 'num_classes'):
                         submodel_cfg_clean['num_labels'] = config.model.num_classes
-                # dropout for BiLSTM
                 if 'dropout' not in submodel_cfg_clean:
                     if 'dropout_rate' in bilstm_model_cfg:
                         submodel_cfg_clean['dropout'] = bilstm_model_cfg['dropout_rate']
                     elif hasattr(config.model, 'dropout_rate'):
                         submodel_cfg_clean['dropout'] = config.model.dropout_rate
-            submodels.append(create_model(
-                model_type=submodel_type,
-                model_config=submodel_cfg_clean
-            ))
+            # INDIVIDUAL STRATEGY: train and save each submodel
+            if strategy == 'individual':
+                print(f"[Ensemble] Training submodel {submodel_type} individually...")
+                submodel = create_model(model_type=submodel_type, model_config=submodel_cfg_clean)
+                # Instantiate tokenizer for transformer submodels
+                trainer_tokenizer = None
+                if submodel_type in ['distilbert', 'twitter-roberta', 'twitter_roberta', 'roberta']:
+                    from transformers import AutoTokenizer
+                    model_name = submodel_cfg.get('model_name', None) or submodel_cfg_clean.get('model_name', None)
+                    if not model_name:
+                        # Fallback to default names
+                        if submodel_type == 'distilbert':
+                            model_name = 'distilbert-base-uncased'
+                        elif submodel_type in ['twitter-roberta', 'twitter_roberta', 'roberta']:
+                            model_name = 'cardiffnlp/twitter-roberta-base-emotion'
+                    trainer_tokenizer = AutoTokenizer.from_pretrained(model_name)
+                trainer = EmotionTrainer(model=submodel, tokenizer=trainer_tokenizer, device=device, save_dir=output_dir)
+                train_texts = datasets['train'].texts
+                train_labels = datasets['train'].labels
+                val_texts = datasets['validation'].texts if 'validation' in datasets else []
+                val_labels = datasets['validation'].labels if 'validation' in datasets else []
+                trainer.train(
+                    train_texts=train_texts,
+                    train_labels=train_labels,
+                    val_texts=val_texts,
+                    val_labels=val_labels,
+                    num_epochs=config.training.num_epochs,
+                    batch_size=config.data.batch_sizes.get('train', 32),
+                    max_length=config.data.get('max_length', 128),
+                    patience=config.training.get('early_stopping', {}).get('patience', 3),
+                    save_best=True
+                )
+                submodel_name = f"{submodel_type}_best_model"
+                trainer.save_model(submodel_name)
+                submodel_path = os.path.join(output_dir, f"{submodel_name}.pt")
+                submodel.load_state_dict(torch.load(submodel_path, weights_only=False)['model_state_dict'])
+                submodels.append(submodel)
+                submodel_paths.append(submodel_path)
+            else:
+                # JOINT STRATEGY: just instantiate submodels
+                submodels.append(create_model(model_type=submodel_type, model_config=submodel_cfg_clean))
         weights = [m.get('weight', 1.0/len(submodels)) for m in config.model.models]
         model = create_model(
             model_type='ensemble',
@@ -322,19 +379,32 @@ def train_model(config, datasets, device: str, output_dir: str):
     
     # Calculate class weights for imbalanced data
     if 'train' in datasets:
-        train_labels = [item['label'].item() if hasattr(item['label'], 'item') else item['label'] for item in datasets['train']]
-        # Convert back to text labels for class weight calculation
-        from src.data_utils import EmotionDataLoader
-        temp_loader = EmotionDataLoader()
-        text_labels = temp_loader.decode_labels(train_labels)
-        class_weights = temp_loader.get_class_weights(text_labels)
-        class_weights = class_weights.to(device)
+        train_labels = datasets['train'].labels
+        num_classes = len(set(train_labels))
+        class_counts = Counter(train_labels)
+        total = sum(class_counts.values())
+        weights = [total / (num_classes * class_counts.get(i, 1)) for i in range(num_classes)]
+        class_weights = torch.tensor(weights, dtype=torch.float, device=device)
     else:
         class_weights = None
     
     # Create trainer
+    # Provide tokenizer for transformer/ensemble models
+    trainer_tokenizer = None
+    if hasattr(model, 'tokenizer'):
+        trainer_tokenizer = model.tokenizer
+    elif hasattr(model, 'models') and hasattr(model.models[0], 'tokenizer'):
+        trainer_tokenizer = model.models[0].tokenizer
+    else:
+        # Try to auto-instantiate for known transformer models
+        from transformers import AutoTokenizer
+        if hasattr(model, 'distilbert'):
+            trainer_tokenizer = AutoTokenizer.from_pretrained('distilbert-base-uncased')
+        elif hasattr(model, 'roberta'):
+            trainer_tokenizer = AutoTokenizer.from_pretrained('cardiffnlp/twitter-roberta-base-emotion')
     trainer = EmotionTrainer(
         model=model,
+        tokenizer=trainer_tokenizer,
         device=device,
         save_dir=output_dir,
         class_weights=class_weights,

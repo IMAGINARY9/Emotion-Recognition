@@ -95,7 +95,8 @@ class EmotionEvaluator:
         class_report = classification_report(
             all_labels, predictions,
             target_names=self.emotion_names,
-            output_dict=True
+            output_dict=True,
+            zero_division=0
         )
         metrics['classification_report'] = class_report
         
@@ -106,6 +107,25 @@ class EmotionEvaluator:
         metrics['error_analysis'] = error_analysis
         
         self.logger.info(f"Evaluation completed. Overall accuracy: {metrics['accuracy']:.4f}")
+
+        # --- Always generate and save reports and plots ---
+        # Save JSON report and human-readable summary
+        model_name = getattr(self.model, 'name', self.model.__class__.__name__)
+        report_path = self.generate_evaluation_report(metrics, test_texts, test_labels, model_name=model_name)
+        self.logger.info(f"Saved JSON evaluation report to: {report_path}")
+        # Save confusion matrix plot
+        cm_path = self.save_dir / f"confusion_matrix_{model_name}.png"
+        self.plot_confusion_matrix(metrics['confusion_matrix'], save_path=str(cm_path))
+        self.logger.info(f"Saved confusion matrix plot to: {cm_path}")
+        # Save per-class metrics plot
+        pcm_path = self.save_dir / f"per_class_metrics_{model_name}.png"
+        self.plot_per_class_metrics(metrics, save_path=str(pcm_path))
+        self.logger.info(f"Saved per-class metrics plot to: {pcm_path}")
+        # Save t-SNE embeddings plot
+        tsne_path = self.save_dir / f"embeddings_tsne_{model_name}.png"
+        self.visualize_embeddings(test_texts, test_labels, save_path=str(tsne_path))
+        self.logger.info(f"Saved t-SNE embeddings plot to: {tsne_path}")
+        # Optionally: add more plots as needed
         
         return metrics
     
@@ -136,18 +156,14 @@ class EmotionEvaluator:
                     input_ids = batch['input_ids'].to(self.device)
                     attention_mask = batch['attention_mask'].to(self.device)
                     labels_batch = batch['label'].to(self.device)
-                    
                     outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
                 else:
                     input_ids = batch['input_ids'].to(self.device)
                     labels_batch = batch['label'].to(self.device)
-                    
-                    outputs = self.model(input_ids=input_ids)
-                
+                    outputs = self.model(input_ids=input_ids, attention_mask=None)
                 logits = outputs['logits']
                 probabilities = F.softmax(logits, dim=-1)
                 predictions = torch.argmax(logits, dim=-1)
-                
                 all_predictions.extend(predictions.cpu().numpy())
                 all_probabilities.extend(probabilities.cpu().numpy())
                 all_labels.extend(labels_batch.cpu().numpy())
@@ -163,12 +179,12 @@ class EmotionEvaluator:
         
         # Basic metrics
         metrics['accuracy'] = accuracy_score(labels, predictions)
-        metrics['precision'] = precision_score(labels, predictions, average='weighted')
+        metrics['precision'] = precision_score(labels, predictions, average='weighted', zero_division=0)
         metrics['recall'] = recall_score(labels, predictions, average='weighted')
         metrics['f1'] = f1_score(labels, predictions, average='weighted')
         
         # Per-class metrics
-        metrics['per_class_precision'] = precision_score(labels, predictions, average=None)
+        metrics['per_class_precision'] = precision_score(labels, predictions, average=None, zero_division=0)
         metrics['per_class_recall'] = recall_score(labels, predictions, average=None)
         metrics['per_class_f1'] = f1_score(labels, predictions, average=None)
         
@@ -251,7 +267,7 @@ class EmotionEvaluator:
         """
         if normalize:
             cm = confusion_matrix.astype('float') / confusion_matrix.sum(axis=1)[:, np.newaxis]
-            title = 'Normalized Confusion Matrix'
+            title = 'Confusion Matrix'
             fmt = '.2f'
         else:
             cm = confusion_matrix

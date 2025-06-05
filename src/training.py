@@ -56,7 +56,7 @@ class EmotionTrainer:
             gradient_clipping: Maximum gradient norm for clipping
             save_dir: Directory to save models
             emotion_names: List of emotion names
-            class_weights: Tensor of class weights for imbalanced data
+            class_weights: Tensor of class weights for imbalanced data (computed from training set)
         """
         self.model = model.to(device)
         self.tokenizer = tokenizer
@@ -131,7 +131,7 @@ class EmotionTrainer:
         
         return train_loader, val_loader
     
-    def train_epoch(self, train_loader: DataLoader, optimizer, scheduler=None) -> Tuple[float, float, float]:
+    def train_epoch(self, train_loader: DataLoader, optimizer, scheduler=None) -> Tuple[float, float, float, Dict]:
         """
         Train for one epoch.
         
@@ -141,7 +141,7 @@ class EmotionTrainer:
             scheduler: Learning rate scheduler
             
         Returns:
-            Tuple of average loss, accuracy, and F1 score
+            Tuple of average loss, accuracy, F1 score, and prediction distribution
         """
         self.model.train()
         total_loss = 0
@@ -157,14 +157,12 @@ class EmotionTrainer:
                 input_ids = batch['input_ids'].to(self.device)
                 attention_mask = batch['attention_mask'].to(self.device)
                 labels = batch['label'].to(self.device)
-                
                 # Forward pass
                 outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
             else:
                 # For traditional models
                 input_ids = batch['input_ids'].to(self.device)
                 labels = batch['label'].to(self.device)
-                
                 outputs = self.model(input_ids=input_ids, labels=labels)
             
             # Use class weights if available
@@ -205,8 +203,15 @@ class EmotionTrainer:
         accuracy = accuracy_score(all_labels, all_predictions)
         f1 = f1_score(all_labels, all_predictions, average='weighted')
         
-        return avg_loss, accuracy, f1
-    
+        # Log prediction distribution
+        unique, counts = np.unique(all_predictions, return_counts=True)
+        pred_dist = dict(zip(unique, counts))
+        self.logger.info(f"Prediction distribution (train): {pred_dist}")
+        if len(pred_dist) == 1:
+            self.logger.warning(f"All predictions in this epoch are for class {unique[0]}. Model may be collapsing.")
+        
+        return avg_loss, accuracy, f1, pred_dist
+
     def validate(self, val_loader: DataLoader) -> Tuple[float, float, float, Dict]:
         """
         Validate the model.
@@ -254,6 +259,13 @@ class EmotionTrainer:
         precision = precision_score(all_labels, all_predictions, average='weighted')
         recall = recall_score(all_labels, all_predictions, average='weighted')
         
+        # Log prediction distribution
+        unique, counts = np.unique(all_predictions, return_counts=True)
+        pred_dist = dict(zip(unique, counts))
+        self.logger.info(f"Prediction distribution (val): {pred_dist}")
+        if len(pred_dist) == 1:
+            self.logger.warning(f"All validation predictions are for class {unique[0]}. Model may be collapsing.")
+        
         # Detailed classification report
         detailed_metrics = {
             'accuracy': accuracy,
@@ -264,7 +276,8 @@ class EmotionTrainer:
                 all_labels, all_predictions, 
                 target_names=self.emotion_names,
                 output_dict=True
-            )
+            ),
+            'prediction_distribution': pred_dist
         }
         
         return avg_loss, accuracy, f1, detailed_metrics
@@ -323,10 +336,11 @@ class EmotionTrainer:
             self.logger.info(f"Epoch {epoch + 1}/{num_epochs}")
             
             # Training
-            train_loss, train_acc, train_f1 = self.train_epoch(train_loader, optimizer, scheduler)
+            train_loss, train_acc, train_f1, train_pred_dist = self.train_epoch(train_loader, optimizer, scheduler)
             
             # Validation
             val_loss, val_acc, val_f1, detailed_metrics = self.validate(val_loader)
+            val_pred_dist = detailed_metrics.get('prediction_distribution', {})
             
             # Update history
             self.history['train_loss'].append(train_loss)
@@ -342,6 +356,8 @@ class EmotionTrainer:
             self.logger.info(f"Epoch {epoch + 1} completed in {epoch_time:.2f}s")
             self.logger.info(f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}, Train F1: {train_f1:.4f}")
             self.logger.info(f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}, Val F1: {val_f1:.4f}")
+            self.logger.info(f"Train prediction distribution: {train_pred_dist}")
+            self.logger.info(f"Val prediction distribution: {val_pred_dist}")
             
             # Save best model
             if save_best and val_f1 > best_val_f1:
@@ -365,14 +381,22 @@ class EmotionTrainer:
         Save the trained model.
         
         Args:
-            model_name: Name for the saved model
+            model_name: Name for the saved model or full path to save file
         """
+        from pathlib import Path
+        import os
         if model_name is None:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             model_name = f"emotion_model_{timestamp}"
-        
-        model_path = self.save_dir / f"{model_name}.pt"
-        
+            model_path = self.save_dir / f"{model_name}.pt"
+        else:
+            # If model_name looks like a path (endswith .pt or contains os.sep), treat as path
+            if model_name.endswith('.pt') or os.sep in model_name or '/' in model_name:
+                model_path = Path(model_name)
+            else:
+                model_path = self.save_dir / f"{model_name}.pt"
+        # Ensure parent directory exists
+        model_path.parent.mkdir(parents=True, exist_ok=True)
         # Save model state dict and metadata
         save_dict = {
             'model_state_dict': self.model.state_dict(),
@@ -381,14 +405,11 @@ class EmotionTrainer:
             'training_history': self.history,
             'timestamp': datetime.now().isoformat()
         }
-        
         torch.save(save_dict, model_path)
-        
         # Save tokenizer if available
         if self.tokenizer:
-            tokenizer_path = self.save_dir / f"{model_name}_tokenizer"
+            tokenizer_path = model_path.parent / f"{model_path.stem}_tokenizer"
             self.tokenizer.save_pretrained(tokenizer_path)
-        
         self.logger.info(f"Model saved to {model_path}")
     
     def load_model(self, model_path: str):
