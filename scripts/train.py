@@ -6,17 +6,19 @@ This script provides a command-line interface for training emotion recognition
 models with different architectures and configurations.
 """
 
-import argparse
-import os
-import sys
-from pathlib import Path
-import logging
 import torch
-import pandas as pd
+
+import argparse
+from pathlib import Path
+import sys
+project_root = str(Path(__file__).parent.parent)
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
 from datetime import datetime
-import json
-import numpy as np
 from collections import Counter
+import os
+import logging
 
 # Add src to path
 sys.path.append(str(Path(__file__).parent.parent / "src"))
@@ -27,102 +29,37 @@ from src.preprocessing import EmotionPreprocessor, EmotionDataProcessor
 from src.models import create_model, EmotionDataset
 from src.training import EmotionTrainer
 from src.evaluation import EmotionEvaluator
+from utils.model_loading import filter_model_config
 
 logger = logging.getLogger(__name__)
 
 def parse_args():
-    """Parse command line arguments."""
+    """Parse command line arguments (refactored for brevity)."""
     parser = argparse.ArgumentParser(
         description="Train emotion recognition models",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
-    
-    # Configuration
-    parser.add_argument(
-        "--config", "-c",
-        type=str,
-        default="distilbert",
-        help="Model configuration to use (distilbert, twitter_roberta, bilstm, ensemble)"
-    )
-    
-    parser.add_argument(
-        "--config-file",
-        type=str,
-        help="Path to custom configuration file"
-    )
-    
-    # Data
-    parser.add_argument(
-        "--data-path",
-        type=str,
-        help="Path to training data CSV file"
-    )
-    
-    parser.add_argument(
-        "--use-sample-data",
-        action="store_true",
-        help="Use generated sample data for testing"
-    )
-    
-    # Training
-    parser.add_argument(
-        "--epochs",
-        type=int,
-        help="Number of training epochs (overrides config)"
-    )
-    
-    parser.add_argument(
-        "--batch-size",
-        type=int,
-        help="Batch size (overrides config)"
-    )
-    
-    parser.add_argument(
-        "--learning-rate",
-        type=float,
-        help="Learning rate (overrides config)"
-    )
-    
-    # Output
-    parser.add_argument(
-        "--experiment-name",
-        type=str,
-        help="Name for this experiment"
-    )
-    
-    parser.add_argument(
-        "--output-dir",
-        type=str,
-        default="outputs",
-        help="Output directory for results"
-    )
-    
-    # Options
-    parser.add_argument(
-        "--no-evaluation",
-        action="store_true",
-        help="Skip evaluation after training"
-    )
-    
-    parser.add_argument(
-        "--force-cpu",
-        action="store_true",
-        help="Force CPU usage"
-    )
-    
-    parser.add_argument(
-        "--verbose",
-        action="store_true",
-        help="Enable verbose logging"
-    )
-    
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-        help="Random seed for reproducibility"
-    )
-    
+    # Config and data
+    parser.add_argument("-c", "--config", type=str, default="distilbert",
+                        help="Model config (distilbert, twitter_roberta, bilstm, ensemble)")
+    parser.add_argument("--config-file", type=str, help="Path to custom config file")
+    parser.add_argument("--data-path", type=str, help="Path to training data CSV")
+    parser.add_argument("--use-sample-data", action="store_true", help="Use generated sample data")
+
+    # Training overrides
+    parser.add_argument("--epochs", type=int, help="Number of training epochs")
+    parser.add_argument("--batch-size", type=int, help="Batch size")
+    parser.add_argument("--learning-rate", type=float, help="Learning rate")
+
+    # Output and options
+    parser.add_argument("--experiment-name", type=str, help="Experiment name")
+    parser.add_argument("--output-dir", type=str, default="models", help="Output directory")
+    parser.add_argument("--no-evaluation", action="store_true", help="Skip evaluation after training")
+    parser.add_argument("--force-cpu", action="store_true", help="Force CPU usage")
+    parser.add_argument("--verbose", action="store_true", help="Enable verbose logging")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--debug-predictions", action="store_true", help="Show debug predictions/logits")
+
     return parser.parse_args()
 
 def set_seed(seed: int):
@@ -203,6 +140,7 @@ def load_and_prepare_data(config, data_path: str = None, use_sample: bool = Fals
 
 def create_datasets(config, data_loader, train_df, val_df, test_df):
     """Create PyTorch datasets."""
+    from src.models import JointEnsembleDataset
     # Initialize preprocessor
     preprocessor = EmotionPreprocessor(
         handle_emojis=config.preprocessing.get('emoji_handling', 'convert'),
@@ -214,24 +152,18 @@ def create_datasets(config, data_loader, train_df, val_df, test_df):
         min_length=3,
         max_length=config.data.get('max_length', 128)
     )
-    
     # Create data processor
-    data_processor = EmotionDataProcessor(
-        preprocessor=preprocessor
-    )
-
+    data_processor = EmotionDataProcessor(preprocessor=preprocessor)
     # Preprocess all splits
     processed_train, processed_val, processed_test = data_processor.process_emotion_dataset(
         train_df, val_df, test_df, text_column=config.data.text_column, label_column=config.data.label_column
     )
-
     # --- BiLSTM-specific: Build vocab and tokenizer ---
     use_bilstm = any(m['type'] == 'bilstm' for m in getattr(config.model, 'models', [])) or getattr(config.model, 'type', None) == 'bilstm'
     bilstm_tokenizer = None
     vocab = None
     if use_bilstm:
         from collections import Counter
-        # Build vocab from training data
         train_texts = processed_train['clean_text'].tolist() if not processed_train.empty else []
         tokens = [word for text in train_texts for word in text.split()]
         vocab_counter = Counter(tokens)
@@ -239,16 +171,40 @@ def create_datasets(config, data_loader, train_df, val_df, test_df):
         vocab['<PAD>'] = 0
         vocab['<UNK>'] = 1
         def bilstm_tokenizer_fn(text):
-            return [vocab.get(word, vocab['<UNK>']) for word in text.split()]
+            return [vocab.get(tok, vocab.get('<UNK>', 1)) for tok in text.split()]
         bilstm_tokenizer = bilstm_tokenizer_fn
-        # Set vocab_size in config for BiLSTM
-        if hasattr(config.model, 'models'):
-            for m in config.model.models:
-                if m['type'] == 'bilstm':
-                    m['vocab_size'] = len(vocab)
-        elif getattr(config.model, 'type', None) == 'bilstm':
-            config.model.vocab_size = len(vocab)
-
+        # --- Save BiLSTM vocab after building ---
+        output_dir = getattr(config.paths, 'output_dir', None)
+        if output_dir:
+            import json
+            Path(output_dir).mkdir(parents=True, exist_ok=True)
+            vocab_path = Path(output_dir) / "bilstm_vocab.json"
+            with open(vocab_path, "w", encoding="utf-8") as f:
+                json.dump(vocab, f)
+            logger.info(f"Saved BiLSTM vocab to {vocab_path}")
+    # Joint training: use JointEnsembleDataset
+    if getattr(config.training, 'strategy', None) == 'joint':
+        datasets = {}
+        label_encoder = data_loader.label_encoder
+        if not processed_train.empty:
+            train_texts, train_labels = data_processor.prepare_for_training(
+                processed_train, text_column='clean_text', label_column=config.data.label_column
+            )
+            train_labels = label_encoder.transform(train_labels)
+            datasets['train'] = JointEnsembleDataset(train_texts, train_labels)
+        if not processed_val.empty:
+            val_texts, val_labels = data_processor.prepare_for_training(
+                processed_val, text_column='clean_text', label_column=config.data.label_column
+            )
+            val_labels = label_encoder.transform(val_labels)
+            datasets['validation'] = JointEnsembleDataset(val_texts, val_labels)
+        if not processed_test.empty:
+            test_texts, test_labels = data_processor.prepare_for_training(
+                processed_test, text_column='clean_text', label_column=config.data.label_column
+            )
+            test_labels = label_encoder.transform(test_labels)
+            datasets['test'] = JointEnsembleDataset(test_texts, test_labels)
+        return datasets, data_processor, vocab
     # Prepare for training and create datasets
     datasets = {}
     label_encoder = data_loader.label_encoder
@@ -285,10 +241,11 @@ def create_datasets(config, data_loader, train_df, val_df, test_df):
             tokenizer=bilstm_tokenizer if use_bilstm else None,
             max_length=config.data.get('max_length', 128)
         )
-    return datasets, data_processor
+    return datasets, data_processor, vocab
 
-def train_model(config, datasets, device: str, output_dir: str):
+def train_model(config, datasets, device: str, output_dir: str, vocab=None, data_loader=None, debug_predictions: bool = False):
     """Train the emotion recognition model."""
+    from src.models import get_joint_ensemble_collate_fn
     # Create model
     # Prepare model config for ensemble
     if config.model.type == 'ensemble':
@@ -296,40 +253,27 @@ def train_model(config, datasets, device: str, output_dir: str):
         config_manager = ConfigManager()
         submodels = []
         submodel_paths = []
-        # Prepare submodel configs
         for i, submodel_cfg in enumerate(config.model.models):
             submodel_type = submodel_cfg['type'].replace('_', '-')
             submodel_cfg_clean = {k: v for k, v in submodel_cfg.items() if k not in ('type', 'weight', 'max_length', 'dropout_rate')}
-            if 'num_classes' not in submodel_cfg_clean and hasattr(config.model, 'num_classes'):
-                submodel_cfg_clean['num_classes'] = config.model.num_classes
-            if 'dropout_rate' not in submodel_cfg_clean and hasattr(config.model, 'dropout_rate'):
-                submodel_cfg_clean['dropout_rate'] = config.model.dropout_rate
+            # Map num_classes to num_labels for all submodels
             if 'num_classes' in submodel_cfg_clean:
                 submodel_cfg_clean['num_labels'] = submodel_cfg_clean.pop('num_classes')
-            if 'dropout_rate' in submodel_cfg_clean:
-                submodel_cfg_clean['dropout'] = submodel_cfg_clean.pop('dropout_rate')
-            # BiLSTM fallback params
+            if 'num_classes' not in submodel_cfg_clean and hasattr(config.model, 'num_classes'):
+                submodel_cfg_clean['num_labels'] = config.model.num_classes
+            if 'dropout_rate' not in submodel_cfg_clean and hasattr(config.model, 'dropout_rate'):
+                submodel_cfg_clean['dropout'] = config.model.dropout_rate
+            # Add vocab_size and vocab for BiLSTM
             if submodel_type == 'bilstm':
-                bilstm_config = config_manager.load_config('configs/bilstm_config.yaml')
-                bilstm_model_cfg = bilstm_config['model']
-                for param in ['vocab_size', 'embedding_dim', 'hidden_dim', 'num_layers']:
-                    if param not in submodel_cfg_clean and param in bilstm_model_cfg:
-                        submodel_cfg_clean[param] = bilstm_model_cfg[param]
-                if 'num_labels' not in submodel_cfg_clean:
-                    if 'num_classes' in bilstm_model_cfg:
-                        submodel_cfg_clean['num_labels'] = bilstm_model_cfg['num_classes']
-                    elif hasattr(config.model, 'num_classes'):
-                        submodel_cfg_clean['num_labels'] = config.model.num_classes
-                if 'dropout' not in submodel_cfg_clean:
-                    if 'dropout_rate' in bilstm_model_cfg:
-                        submodel_cfg_clean['dropout'] = bilstm_model_cfg['dropout_rate']
-                    elif hasattr(config.model, 'dropout_rate'):
-                        submodel_cfg_clean['dropout'] = config.model.dropout_rate
-            # INDIVIDUAL STRATEGY: train and save each submodel
+                if vocab is None:
+                    raise ValueError('vocab must be built for BiLSTM submodel')
+                submodel_cfg_clean['vocab_size'] = len(vocab)
+                if 'vocab' in submodel_cfg_clean:
+                    del submodel_cfg_clean['vocab']
+            # Individual training for ensemble
             if strategy == 'individual':
                 print(f"[Ensemble] Training submodel {submodel_type} individually...")
                 submodel = create_model(model_type=submodel_type, model_config=submodel_cfg_clean)
-                # Instantiate tokenizer for transformer submodels
                 trainer_tokenizer = None
                 if submodel_type in ['distilbert', 'twitter-roberta', 'twitter_roberta', 'roberta']:
                     from transformers import AutoTokenizer
@@ -364,7 +308,6 @@ def train_model(config, datasets, device: str, output_dir: str):
                 submodels.append(submodel)
                 submodel_paths.append(submodel_path)
             else:
-                # JOINT STRATEGY: just instantiate submodels
                 submodels.append(create_model(model_type=submodel_type, model_config=submodel_cfg_clean))
         weights = [m.get('weight', 1.0/len(submodels)) for m in config.model.models]
         model = create_model(
@@ -376,7 +319,6 @@ def train_model(config, datasets, device: str, output_dir: str):
             model_type=config.model.type,
             model_config=dict(config.model)
         )
-    
     # Calculate class weights for imbalanced data
     if 'train' in datasets:
         train_labels = datasets['train'].labels
@@ -387,8 +329,6 @@ def train_model(config, datasets, device: str, output_dir: str):
         class_weights = torch.tensor(weights, dtype=torch.float, device=device)
     else:
         class_weights = None
-    
-    # Create trainer
     # Provide tokenizer for transformer/ensemble models
     trainer_tokenizer = None
     if hasattr(model, 'tokenizer'):
@@ -396,7 +336,6 @@ def train_model(config, datasets, device: str, output_dir: str):
     elif hasattr(model, 'models') and hasattr(model.models[0], 'tokenizer'):
         trainer_tokenizer = model.models[0].tokenizer
     else:
-        # Try to auto-instantiate for known transformer models
         from transformers import AutoTokenizer
         if hasattr(model, 'distilbert'):
             trainer_tokenizer = AutoTokenizer.from_pretrained('distilbert-base-uncased')
@@ -409,16 +348,31 @@ def train_model(config, datasets, device: str, output_dir: str):
         save_dir=output_dir,
         class_weights=class_weights,
     )
-    
     # Create data loaders
     from src.data_utils import EmotionDataLoader
-    data_loader = EmotionDataLoader()
-    data_loaders = data_loader.create_data_loaders(
-        datasets,
-        batch_sizes=config.data.batch_sizes,
-        num_workers=config.data.get('num_workers', 0)
-    )
-    
+    # Joint strategy: use joint collate_fn and tokenizers
+    if getattr(config.training, 'strategy', None) == 'joint':
+        from transformers import AutoTokenizer
+        tokenizers = {
+            'distilbert': AutoTokenizer.from_pretrained('distilbert-base-uncased'),
+            'twitter-roberta': AutoTokenizer.from_pretrained('cardiffnlp/twitter-roberta-base-emotion')
+        }
+        if vocab is not None:
+            tokenizers['bilstm'] = None
+        collate_fn = get_joint_ensemble_collate_fn(tokenizers, max_length=config.data.get('max_length', 128), vocab=vocab)
+        from torch.utils.data import DataLoader
+        train_loader = DataLoader(datasets['train'], batch_size=config.data.batch_sizes.get('train', 16), shuffle=True, collate_fn=collate_fn)
+        val_loader = DataLoader(datasets['validation'], batch_size=config.data.batch_sizes.get('validation', 32), shuffle=False, collate_fn=collate_fn)
+        data_loaders = {'train': train_loader, 'validation': val_loader}
+    else:
+        if data_loader is None:
+            from src.data_utils import EmotionDataLoader
+            data_loader = EmotionDataLoader()
+        data_loaders = data_loader.create_data_loaders(
+            datasets,
+            batch_sizes=config.data.batch_sizes,
+            num_workers=config.data.get('num_workers', 0)
+        )
     # Training configuration
     training_config = {
         'learning_rate': config.training.learning_rate,
@@ -428,41 +382,51 @@ def train_model(config, datasets, device: str, output_dir: str):
         'gradient_clip_norm': config.training.gradient_clip_norm,
         'accumulation_steps': config.training.get('accumulation_steps', 1)
     }
-    
-    # Early stopping configuration
     early_stopping_config = None
     if config.training.get('early_stopping', {}).get('enabled', False):
         early_stopping_config = config.training.early_stopping
-    
-    # Train model
     logger.info("Starting training...")
-    # For traditional models, pass texts and labels
-    train_texts = datasets['train'].texts
-    train_labels = datasets['train'].labels
-    val_texts = datasets['validation'].texts if 'validation' in datasets else []
-    val_labels = datasets['validation'].labels if 'validation' in datasets else []
-    training_history = trainer.train(
-        train_texts=train_texts,
-        train_labels=train_labels,
-        val_texts=val_texts,
-        val_labels=val_labels,
-        num_epochs=config.training.num_epochs,
-        batch_size=config.data.batch_sizes.get('train', 32),
-        max_length=config.data.get('max_length', 128),
-        patience=config.training.get('early_stopping', {}).get('patience', 3),
-        save_best=True
-    )
-    
-    # Save training history
+    if getattr(config.training, 'strategy', None) == 'joint':
+        training_history = trainer.train(
+            num_epochs=config.training.num_epochs,
+            batch_size=config.data.batch_sizes.get('train', 16),
+            max_length=config.data.get('max_length', 128),
+            patience=config.training.get('early_stopping', {}).get('patience', 3),
+            save_best=True,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            debug_predictions=debug_predictions
+        )
+    else:
+        train_texts = datasets['train'].texts
+        train_labels = datasets['train'].labels
+        val_texts = datasets['validation'].texts if 'validation' in datasets else []
+        val_labels = datasets['validation'].labels if 'validation' in datasets else []
+        training_history = trainer.train(
+            train_texts=train_texts,
+            train_labels=train_labels,
+            val_texts=val_texts,
+            val_labels=val_labels,
+            num_epochs=config.training.num_epochs,
+            batch_size=config.data.batch_sizes.get('train', 32),
+            max_length=config.data.get('max_length', 128),
+            patience=config.training.get('early_stopping', {}).get('patience', 3),
+            save_best=True,
+            debug_predictions=debug_predictions
+        )
     history_path = os.path.join(output_dir, "training_history.json")
     with open(history_path, 'w') as f:
         json.dump(training_history, f, indent=2)
-    
     logger.info(f"Training completed. Model saved to: {output_dir}")
-    
+    # After vocab is built and output_dir is known:
+    if vocab is not None:
+        vocab_path = Path(output_dir) / "bilstm_vocab.json"
+        with open(vocab_path, "w", encoding="utf-8") as f:
+            json.dump(vocab, f)
+        logger.info(f"Saved BiLSTM vocab to {vocab_path}")
     return trainer, training_history
 
-def evaluate_model(config, trainer, datasets, device: str, output_dir: str):
+def evaluate_model(config, trainer, datasets, device: str, output_dir: str, debug_predictions: bool = False):
     """Evaluate the trained model."""
     if config.get('no_evaluation', False):
         logger.info("Skipping evaluation as requested")
@@ -481,12 +445,12 @@ def evaluate_model(config, trainer, datasets, device: str, output_dir: str):
     if 'test' in datasets:
         test_texts = datasets['test'].texts
         test_labels = datasets['test'].labels
-        # Run evaluation using evaluate_model
         results = evaluator.evaluate_model(
             test_texts,
             test_labels,
             batch_size=config.data.batch_sizes.get('test', 64),
-            max_length=config.data.get('max_length', 128)
+            max_length=config.data.get('max_length', 128),
+            debug_predictions=debug_predictions
         )
 
         # Generate report
@@ -507,21 +471,78 @@ def evaluate_model(config, trainer, datasets, device: str, output_dir: str):
         logger.warning("No test set available for evaluation")
         return None
 
+def train_and_save_individual_model(submodel_type, submodel_cfg, datasets, device, output_dir, vocab=None, debug_predictions=False):
+    from transformers import AutoTokenizer
+    from src.training import EmotionTrainer
+    from src.models import BiLSTMEmotionModel, DistilBERTEmotionModel, TwitterRoBERTaEmotionModel
+    # Map model type to class
+    model_class_map = {
+        'bilstm': BiLSTMEmotionModel,
+        'distilbert': DistilBERTEmotionModel,
+        'twitter-roberta': TwitterRoBERTaEmotionModel,
+        'twitter_roberta': TwitterRoBERTaEmotionModel,
+        'roberta': TwitterRoBERTaEmotionModel
+    }
+    model_class = model_class_map.get(submodel_type, None)
+    if model_class is None:
+        raise ValueError(f"Unknown model type: {submodel_type}")
+    # Prepare model config (universal filtering)
+    model_config = dict(submodel_cfg)
+    if submodel_type == 'bilstm' and vocab is not None:
+        model_config['vocab_size'] = len(vocab)
+        model_config['vocab'] = vocab
+    model_config = filter_model_config(model_class, model_config)
+    model = create_model(model_type=submodel_type, model_config=model_config)
+    # Tokenizer
+    tokenizer = None
+    if submodel_type == 'distilbert':
+        tokenizer = AutoTokenizer.from_pretrained(model_config.get('model_name', 'distilbert-base-uncased'))
+    elif submodel_type in ['twitter-roberta', 'twitter_roberta', 'roberta']:
+        tokenizer = AutoTokenizer.from_pretrained(model_config.get('model_name', 'cardiffnlp/twitter-roberta-base-emotion'))
+    # Trainer
+    trainer = EmotionTrainer(model=model, tokenizer=tokenizer, device=device, save_dir=output_dir)
+    train_texts = datasets['train'].texts
+    train_labels = datasets['train'].labels
+    val_texts = datasets['validation'].texts if 'validation' in datasets else []
+    val_labels = datasets['validation'].labels if 'validation' in datasets else []
+    trainer.train(
+        train_texts=train_texts,
+        train_labels=train_labels,
+        val_texts=val_texts,
+        val_labels=val_labels,
+        num_epochs=submodel_cfg.get('num_epochs', 5),
+        batch_size=submodel_cfg.get('batch_size', 32),
+        max_length=submodel_cfg.get('max_length', 128),
+        patience=submodel_cfg.get('early_stopping', {}).get('patience', 3),
+        save_best=True
+    )
+    # Save model checkpoint
+    model_name = f"{submodel_type}_best_model"
+    trainer.save_model(model_name)
+    # Save tokenizer if applicable
+    if tokenizer:
+        tokenizer_dir = Path(output_dir) / f"{model_name}_tokenizer"
+        tokenizer.save_pretrained(tokenizer_dir)
+    # Save vocab if BiLSTM
+    if submodel_type == 'bilstm' and vocab is not None:
+        vocab_path = Path(output_dir) / "bilstm_vocab.json"
+        with open(vocab_path, "w", encoding="utf-8") as f:
+            json.dump(vocab, f)
+    # Save training history
+    history_path = Path(output_dir) / f"{model_name}_history.json"
+    with open(history_path, "w", encoding="utf-8") as f:
+        json.dump(trainer.history, f, indent=2)
+    return model, trainer
+
 def main():
     """Main training function."""
     args = parse_args()
-    
-    # Set random seed
     set_seed(args.seed)
-    
-    # Load configuration
     config_manager = ConfigManager()
-    
     if args.config_file:
         config = config_manager.load_config(args.config_file)
     else:
         config = config_manager.load_model_config(args.config)
-    
     # Apply command line overrides
     overrides = {}
     if args.epochs:
@@ -535,75 +556,117 @@ def main():
         overrides['device.force_cpu'] = True
     if args.output_dir:
         overrides['paths.output_dir'] = args.output_dir
-    
     if overrides:
         config = config_manager.merge_configs(config, overrides)
-    
-    # Validate configuration
     config_manager.validate_config(config)
-    
-    # Setup logging
     if args.verbose:
         config.logging.level = "DEBUG"
     setup_logging(config)
-    
-    # Get device
     device = get_device_config(config)
     logger.info(f"Using device: {device}")
-    
-    # Create experiment directory
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     experiment_name = args.experiment_name or f"{config.model.type}_{timestamp}"
     output_dir = Path(config.paths.output_dir) / experiment_name
     output_dir.mkdir(parents=True, exist_ok=True)
-    
     logger.info(f"Experiment: {experiment_name}")
     logger.info(f"Output directory: {output_dir}")
-    
-    # Save configuration
     config_path = output_dir / "config.yaml"
     config_manager.save_config(config, config_path)
-    
     try:
-        # Load and prepare data
-        data_loader, train_df, val_df, test_df = load_and_prepare_data(
-            config, args.data_path, args.use_sample_data
-        )
-        
-        # Create datasets
-        datasets, data_processor = create_datasets(
-            config, data_loader, train_df, val_df, test_df
-        )
-        
-        # Train model
-        trainer, training_history = train_model(
-            config, datasets, device, str(output_dir)
-        )
-        
-        # Evaluate model
+        # --- Data Preparation ---
+        data_loader, train_df, val_df, test_df = load_and_prepare_data(config, args.data_path, args.use_sample_data)
+        datasets, data_processor, vocab = create_datasets(config, data_loader, train_df, val_df, test_df)
+        # --- Training ---
+        if getattr(config.model, 'type', None) == 'ensemble':
+            strategy = getattr(config.training, 'strategy', 'joint')
+            submodels = []
+            submodel_trainers = []
+            submodel_dirs = []
+            if strategy == 'individual':
+                # Train each submodel separately and save assets
+                for i, sub_cfg in enumerate(config.model.models):
+                    sub_type = sub_cfg['type'].replace('_', '-')
+                    sub_dir = output_dir / f"{sub_type}_submodel"
+                    sub_dir.mkdir(parents=True, exist_ok=True)
+                    logger.info(f"[Ensemble-Individual] Training submodel: {sub_type} (dir: {sub_dir})")
+                    model, trainer = train_and_save_individual_model(sub_type, sub_cfg, datasets, device, sub_dir, vocab=vocab, debug_predictions=args.debug_predictions)
+                    submodels.append(model)
+                    submodel_trainers.append(trainer)
+                    submodel_dirs.append(sub_dir)
+                # Save ensemble config and submodel references
+                ensemble_config = dict(config.model)
+                ensemble_config['submodel_dirs'] = [str(d) for d in submodel_dirs]
+                with open(output_dir / "ensemble_config.json", "w", encoding="utf-8") as f:
+                    json.dump(ensemble_config, f, indent=2)
+                # Save top-level config again for clarity
+                config_manager.save_config(config, output_dir / "config.yaml")
+                logger.info(f"Ensemble (individual) training complete. All submodels saved.")
+            else:
+                # Joint training: train ensemble as a single model
+                from src.models import get_joint_ensemble_collate_fn
+                from torch.utils.data import DataLoader
+                from transformers import AutoTokenizer
+                tokenizers = {
+                    'distilbert': AutoTokenizer.from_pretrained('distilbert-base-uncased'),
+                    'twitter-roberta': AutoTokenizer.from_pretrained('cardiffnlp/twitter-roberta-base-emotion')
+                }
+                collate_fn = get_joint_ensemble_collate_fn(tokenizers, max_length=config.data.get('max_length', 128), vocab=vocab)
+                train_loader = DataLoader(datasets['train'], batch_size=config.data.batch_sizes.get('train', 16), shuffle=True, collate_fn=collate_fn)
+                val_loader = DataLoader(datasets['validation'], batch_size=config.data.batch_sizes.get('validation', 32), shuffle=False, collate_fn=collate_fn)
+                # Build ensemble model
+                submodels = []
+                for sub_cfg in config.model.models:
+                    sub_type = sub_cfg['type'].replace('_', '-')
+                    submodel_cfg = dict(sub_cfg)
+                    if sub_type == 'bilstm' and vocab is not None:
+                        submodel_cfg['vocab_size'] = len(vocab)
+                        submodel_cfg['vocab'] = vocab
+                    submodel = create_model(model_type=sub_type, model_config=submodel_cfg)
+                    submodels.append(submodel)
+                weights = [m.get('weight', 1.0/len(submodels)) for m in config.model.models]
+                ensemble_model = create_model(model_type='ensemble', model_config={'models': submodels, 'weights': weights})
+                from src.training import EmotionTrainer
+                trainer = EmotionTrainer(model=ensemble_model, device=device, save_dir=str(output_dir))
+                training_history = trainer.train(
+                    num_epochs=config.training.num_epochs,
+                    batch_size=config.data.batch_sizes.get('train', 16),
+                    max_length=config.data.get('max_length', 128),
+                    patience=config.training.get('early_stopping', {}).get('patience', 3),
+                    save_best=True,
+                    train_loader=train_loader,
+                    val_loader=val_loader,
+                    debug_predictions=args.debug_predictions
+                )
+                # Save ensemble model checkpoint
+                trainer.save_model("ensemble_best_model")
+                # Save tokenizers for submodels
+                for sub_cfg in config.model.models:
+                    sub_type = sub_cfg['type'].replace('_', '-')
+                    if sub_type == 'distilbert':
+                        tokenizer = AutoTokenizer.from_pretrained('distilbert-base-uncased')
+                        tokenizer.save_pretrained(output_dir / 'distilbert_best_model_tokenizer')
+                    elif sub_type in ['twitter-roberta', 'twitter_roberta', 'roberta']:
+                        tokenizer = AutoTokenizer.from_pretrained('cardiffnlp/twitter-roberta-base-emotion')
+                        tokenizer.save_pretrained(output_dir / 'twitter-roberta_best_model_tokenizer')
+                # Save BiLSTM vocab if present
+                if vocab is not None:
+                    vocab_path = output_dir / "bilstm_vocab.json"
+                    with open(vocab_path, "w", encoding="utf-8") as f:
+                        json.dump(vocab, f)
+                # Save training history
+                with open(output_dir / "training_history.json", "w", encoding="utf-8") as f:
+                    json.dump(training_history, f, indent=2)
+                logger.info(f"Ensemble (joint) training complete. Model and assets saved.")
+        else:
+            # Single model training
+            sub_type = config.model.type.replace('_', '-')
+            logger.info(f"Training single model: {sub_type}")
+            model, trainer = train_and_save_individual_model(sub_type, dict(config.model), datasets, device, output_dir, vocab=vocab, debug_predictions=args.debug_predictions)
+        # --- Evaluation ---
         if not args.no_evaluation:
-            evaluation_results = evaluate_model(
-                config, trainer, datasets, device, str(output_dir)
-            )
-        
-        logger.info("Training pipeline completed successfully!")
-        
-        # Print summary
-        print("\n" + "="*50)
-        print("TRAINING SUMMARY")
-        print("="*50)
-        print(f"Experiment: {experiment_name}")
-        print(f"Model: {config.model.type}")
-        print(f"Device: {device}")
-        print(f"Epochs: {config.training.num_epochs}")
-        print(f"Final Training Loss: {training_history['train_loss'][-1]:.4f}")
-        if 'val_loss' in training_history:
-            print(f"Final Validation Loss: {training_history['val_loss'][-1]:.4f}")
-        print(f"Output Directory: {output_dir}")
-        print("="*50)
-        
+            evaluate_model(config, trainer if 'trainer' in locals() else submodel_trainers[0], datasets, device, str(output_dir), debug_predictions=args.debug_predictions)
     except Exception as e:
-        logger.error(f"Training failed: {str(e)}")
+        logger.exception(f"Error during training: {e}")
         raise
 
 if __name__ == "__main__":

@@ -131,7 +131,7 @@ class EmotionTrainer:
         
         return train_loader, val_loader
     
-    def train_epoch(self, train_loader: DataLoader, optimizer, scheduler=None) -> Tuple[float, float, float, Dict]:
+    def train_epoch(self, train_loader: DataLoader, optimizer, scheduler=None, debug_predictions: bool = False) -> Tuple[float, float, float, Dict]:
         """
         Train for one epoch.
         
@@ -151,19 +151,35 @@ class EmotionTrainer:
         progress_bar = tqdm(train_loader, desc="Training")
         
         for batch in progress_bar:
-            # Move batch to device
-            if self.tokenizer:
-                # For transformer models
-                input_ids = batch['input_ids'].to(self.device)
-                attention_mask = batch['attention_mask'].to(self.device)
-                labels = batch['label'].to(self.device)
-                # Forward pass
-                outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+            # Joint ensemble: batch is a dict with submodel keys
+            if any(k in batch for k in ['distilbert', 'twitter-roberta', 'bilstm']):
+                for k in batch:
+                    if isinstance(batch[k], dict):
+                        for subk in batch[k]:
+                            batch[k][subk] = batch[k][subk].to(self.device)
+                labels = batch['labels'].to(self.device)
+                # Only pass debug_predictions if model is ensemble
+                if hasattr(self.model, 'is_ensemble') or 'Ensemble' in self.model.__class__.__name__:
+                    outputs = self.model(**batch, debug_predictions=debug_predictions)
+                else:
+                    outputs = self.model(**batch)
             else:
-                # For traditional models
-                input_ids = batch['input_ids'].to(self.device)
-                labels = batch['label'].to(self.device)
-                outputs = self.model(input_ids=input_ids, labels=labels)
+                # Single model
+                if self.tokenizer:
+                    input_ids = batch['input_ids'].to(self.device)
+                    attention_mask = batch['attention_mask'].to(self.device)
+                    labels = batch['label'].to(self.device)
+                    if hasattr(self.model, 'is_ensemble') or 'Ensemble' in self.model.__class__.__name__:
+                        outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, labels=labels, debug_predictions=debug_predictions)
+                    else:
+                        outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+                else:
+                    input_ids = batch['input_ids'].to(self.device)
+                    labels = batch['label'].to(self.device)
+                    if hasattr(self.model, 'is_ensemble') or 'Ensemble' in self.model.__class__.__name__:
+                        outputs = self.model(input_ids=input_ids, labels=labels, debug_predictions=debug_predictions)
+                    else:
+                        outputs = self.model(input_ids=input_ids, labels=labels)
             
             # Use class weights if available
             if self.class_weights is not None:
@@ -212,7 +228,7 @@ class EmotionTrainer:
         
         return avg_loss, accuracy, f1, pred_dist
 
-    def validate(self, val_loader: DataLoader) -> Tuple[float, float, float, Dict]:
+    def validate(self, val_loader: DataLoader, debug_predictions: bool = False) -> Tuple[float, float, float, Dict]:
         """
         Validate the model.
         
@@ -229,16 +245,32 @@ class EmotionTrainer:
         
         with torch.no_grad():
             for batch in tqdm(val_loader, desc="Validation"):
-                # Move batch to device
-                if self.tokenizer:
-                    input_ids = batch['input_ids'].to(self.device)
-                    attention_mask = batch['attention_mask'].to(self.device)
-                    labels = batch['label'].to(self.device)
-                    outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+                if any(k in batch for k in ['distilbert', 'twitter-roberta', 'bilstm']):
+                    for k in batch:
+                        if isinstance(batch[k], dict):
+                            for subk in batch[k]:
+                                batch[k][subk] = batch[k][subk].to(self.device)
+                    labels = batch['labels'].to(self.device)
+                    if hasattr(self.model, 'is_ensemble') or 'Ensemble' in self.model.__class__.__name__:
+                        outputs = self.model(**batch, debug_predictions=debug_predictions)
+                    else:
+                        outputs = self.model(**batch)
                 else:
-                    input_ids = batch['input_ids'].to(self.device)
-                    labels = batch['label'].to(self.device)
-                    outputs = self.model(input_ids=input_ids, labels=labels)
+                    if self.tokenizer:
+                        input_ids = batch['input_ids'].to(self.device)
+                        attention_mask = batch['attention_mask'].to(self.device)
+                        labels = batch['label'].to(self.device)
+                        if hasattr(self.model, 'is_ensemble') or 'Ensemble' in self.model.__class__.__name__:
+                            outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, labels=labels, debug_predictions=debug_predictions)
+                        else:
+                            outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+                    else:
+                        input_ids = batch['input_ids'].to(self.device)
+                        labels = batch['label'].to(self.device)
+                        if hasattr(self.model, 'is_ensemble') or 'Ensemble' in self.model.__class__.__name__:
+                            outputs = self.model(input_ids=input_ids, labels=labels, debug_predictions=debug_predictions)
+                        else:
+                            outputs = self.model(input_ids=input_ids, labels=labels)
                 # Use class weights if available
                 if self.class_weights is not None:
                     loss_fct = nn.CrossEntropyLoss(weight=self.class_weights)
@@ -283,65 +315,49 @@ class EmotionTrainer:
         return avg_loss, accuracy, f1, detailed_metrics
     
     def train(self, 
-              train_texts: List[str], 
-              train_labels: List[int],
-              val_texts: List[str], 
-              val_labels: List[int],
+              train_texts: List[str] = None, 
+              train_labels: List[int] = None,
+              val_texts: List[str] = None, 
+              val_labels: List[int] = None,
               num_epochs: int = 5,
               batch_size: int = 32,
               max_length: int = 128,
               patience: int = 3,
-              save_best: bool = True) -> Dict:
+              save_best: bool = True,
+              train_loader=None,
+              val_loader=None,
+              debug_predictions: bool = False) -> Dict:
         """
         Train the emotion recognition model.
-        
-        Args:
-            train_texts: Training texts
-            train_labels: Training labels
-            val_texts: Validation texts
-            val_labels: Validation labels
-            num_epochs: Number of training epochs
-            batch_size: Batch size
-            max_length: Maximum sequence length
-            patience: Early stopping patience
-            save_best: Whether to save the best model
-            
-        Returns:
-            Training history dictionary
+        If train_loader/val_loader are provided, use them directly (for joint ensemble training).
+        Otherwise, create DataLoaders from texts/labels (for individual training).
         """
-        self.logger.info(f"Starting training with {len(train_texts)} training samples and {len(val_texts)} validation samples")
-        
-        # Create data loaders
-        train_loader, val_loader = self.create_data_loaders(
-            train_texts, train_labels, val_texts, val_labels, batch_size, max_length
-        )
-        
+        self.logger.info(f"Starting training with {num_epochs} epochs")
+        if train_loader is None or val_loader is None:
+            self.logger.info("Creating DataLoaders from texts/labels (individual training mode)")
+            train_loader, val_loader = self.create_data_loaders(
+                train_texts, train_labels, val_texts, val_labels, batch_size, max_length
+            )
+        else:
+            self.logger.info("Using provided DataLoaders (joint ensemble mode)")
         # Setup optimizer and scheduler
         optimizer = AdamW(self.model.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay)
-        
         total_steps = len(train_loader) * num_epochs
         scheduler = get_linear_schedule_with_warmup(
             optimizer, 
             num_warmup_steps=self.warmup_steps,
             num_training_steps=total_steps
         )
-        
-        # Training loop
         best_val_f1 = 0
         patience_counter = 0
-        
         for epoch in range(num_epochs):
             start_time = time.time()
-            
             self.logger.info(f"Epoch {epoch + 1}/{num_epochs}")
-            
             # Training
-            train_loss, train_acc, train_f1, train_pred_dist = self.train_epoch(train_loader, optimizer, scheduler)
-            
+            train_loss, train_acc, train_f1, train_pred_dist = self.train_epoch(train_loader, optimizer, scheduler, debug_predictions=debug_predictions)
             # Validation
-            val_loss, val_acc, val_f1, detailed_metrics = self.validate(val_loader)
+            val_loss, val_acc, val_f1, detailed_metrics = self.validate(val_loader, debug_predictions=debug_predictions)
             val_pred_dist = detailed_metrics.get('prediction_distribution', {})
-            
             # Update history
             self.history['train_loss'].append(train_loss)
             self.history['val_loss'].append(val_loss)
@@ -349,31 +365,19 @@ class EmotionTrainer:
             self.history['val_accuracy'].append(val_acc)
             self.history['train_f1'].append(train_f1)
             self.history['val_f1'].append(val_f1)
-            
-            epoch_time = time.time() - start_time
-            
-            # Log metrics
-            self.logger.info(f"Epoch {epoch + 1} completed in {epoch_time:.2f}s")
-            self.logger.info(f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}, Train F1: {train_f1:.4f}")
-            self.logger.info(f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}, Val F1: {val_f1:.4f}")
-            self.logger.info(f"Train prediction distribution: {train_pred_dist}")
-            self.logger.info(f"Val prediction distribution: {val_pred_dist}")
-            
-            # Save best model
-            if save_best and val_f1 > best_val_f1:
+            # Early stopping
+            if val_f1 > best_val_f1:
                 best_val_f1 = val_f1
-                self.save_model(f"best_model_epoch_{epoch + 1}")
                 patience_counter = 0
-                self.logger.info(f"New best model saved with F1: {best_val_f1:.4f}")
+                if save_best:
+                    self.save_model("best_model")
             else:
                 patience_counter += 1
-            
-            # Early stopping
-            if patience_counter >= patience:
-                self.logger.info(f"Early stopping triggered after {patience} epochs without improvement")
-                break
-        
-        self.logger.info("Training completed!")
+                if patience_counter >= patience:
+                    self.logger.info(f"Early stopping triggered at epoch {epoch+1}")
+                    break
+            epoch_time = time.time() - start_time
+            self.logger.info(f"Epoch {epoch+1} completed in {epoch_time:.2f}s | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Train F1: {train_f1:.4f} | Val F1: {val_f1:.4f}")
         return self.history
     
     def save_model(self, model_name: str = None):

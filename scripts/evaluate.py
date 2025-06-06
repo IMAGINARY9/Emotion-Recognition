@@ -15,6 +15,12 @@ import torch
 import pandas as pd
 import json
 
+project_root = str(Path(__file__).parent.parent)
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
+from transformers import AutoTokenizer
+
 # Add src to path
 sys.path.append(str(Path(__file__).parent.parent / "src"))
 
@@ -23,6 +29,7 @@ from src.data_utils import EmotionDataLoader
 from src.preprocessing import EmotionPreprocessor, EmotionDataProcessor
 from src.models import create_model, EmotionDataset
 from src.evaluation import EmotionEvaluator
+from utils.model_loading import load_model_and_assets, filter_model_config
 
 logger = logging.getLogger(__name__)
 
@@ -40,107 +47,12 @@ def parse_args():
     parser.add_argument("--batch-size", type=int, default=64, help="Batch size for evaluation")
     parser.add_argument("--force-cpu", action="store_true", help="Force CPU usage")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose logging")
+    parser.add_argument(
+        "--debug-predictions",
+        action="store_true",
+        help="Show ensemble debug predictions/logits during evaluation"
+    )
     return parser.parse_args()
-
-def load_model_and_config(model_path: str, config_path: str = None):
-    """Load trained model and configuration."""
-    model_path = Path(model_path)
-    if config_path:
-        config_manager = ConfigManager()
-        config = config_manager.load_config(config_path)
-    elif (model_path / "config.yaml").exists():
-        config_manager = ConfigManager()
-        config = config_manager.load_config(model_path / "config.yaml")
-    else:
-        raise FileNotFoundError("Configuration file not found. Please specify --config-path")
-    model_config = dict(config.model)
-    model_type = model_config.pop('type').replace('_', '-')
-    if 'num_classes' in model_config:
-        model_config['num_labels'] = model_config.pop('num_classes')
-    if model_type == 'ensemble':
-        submodels, weights = [], []
-        for sub_cfg in config.model.models:
-            sub_cfg = dict(sub_cfg)
-            weight = sub_cfg.pop('weight', 1.0/len(config.model.models))
-            weights.append(weight)
-            sub_type = sub_cfg.pop('type').replace('_', '-')
-            if 'num_classes' not in sub_cfg:
-                sub_cfg['num_classes'] = config.model.get('num_classes', 6)
-            if 'num_classes' in sub_cfg:
-                sub_cfg['num_labels'] = sub_cfg['num_classes']
-                sub_cfg.pop('num_classes')
-            for k in ['dropout_rate', 'max_length', 'bidirectional', 'attention']:
-                if k in sub_cfg:
-                    if k == 'dropout_rate':
-                        sub_cfg['dropout'] = sub_cfg.pop(k)
-                    else:
-                        sub_cfg.pop(k)
-            if sub_type == 'bilstm':
-                vocab_path = model_path / 'bilstm_vocab.json'
-                if vocab_path.exists():
-                    with open(vocab_path, 'r', encoding='utf-8') as f:
-                        vocab = json.load(f)
-                    sub_cfg['vocab'] = vocab
-                    sub_cfg['vocab_size'] = len(vocab)
-                else:
-                    logger.warning(f"BiLSTM vocab file not found: {vocab_path}, skipping BiLSTM submodel.")
-                    continue
-                if 'pretrained_embeddings' in sub_cfg:
-                    if not isinstance(sub_cfg['pretrained_embeddings'], torch.Tensor):
-                        sub_cfg.pop('pretrained_embeddings')
-            submodel = create_model(model_type=sub_type, model_config=sub_cfg)
-            if sub_type == 'distilbert':
-                checkpoint_path = model_path / 'distilbert_best_model.pt'
-            elif sub_type == 'twitter-roberta':
-                checkpoint_path = model_path / 'twitter-roberta_best_model.pt'
-            else:
-                continue
-            if not checkpoint_path.exists():
-                logger.warning(f"Model checkpoint not found: {checkpoint_path}, skipping.")
-                continue
-            checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
-            if 'model_state_dict' in checkpoint:
-                submodel.load_state_dict(checkpoint['model_state_dict'])
-            else:
-                submodel.load_state_dict(checkpoint)
-            logger.info(f"Loaded {sub_type} model from: {checkpoint_path}")
-            submodels.append(submodel)
-        model = create_model(model_type='ensemble', model_config={'models': submodels, 'weights': weights[:len(submodels)]})
-        logger.info(f"Created ensemble model with {len(submodels)} components")
-    else:
-        checkpoint_path = None
-        if model_path.is_file() and model_path.suffix in ['.pt', '.pth']:
-            checkpoint_path = model_path
-        elif (model_path / "best_model.pt").exists():
-            checkpoint_path = model_path / "best_model.pt"
-        elif (model_path / "final_model.pt").exists():
-            checkpoint_path = model_path / "final_model.pt"
-        else:
-            raise FileNotFoundError(f"Model checkpoint not found in {model_path}")
-        for k in ['dropout_rate', 'max_length', 'bidirectional', 'attention']:
-            if k in model_config:
-                if k == 'dropout_rate':
-                    model_config['dropout'] = model_config.pop(k)
-                else:
-                    model_config.pop(k)
-        if model_type == 'bilstm':
-            vocab_path = model_path.parent / 'bilstm_vocab.json'
-            if vocab_path.exists():
-                with open(vocab_path, 'r', encoding='utf-8') as f:
-                    vocab = json.load(f)
-                model_config['vocab'] = vocab
-                model_config['vocab_size'] = len(vocab)
-            if 'pretrained_embeddings' in model_config:
-                if not isinstance(model_config['pretrained_embeddings'], torch.Tensor):
-                    model_config.pop('pretrained_embeddings')
-        model = create_model(model_type=model_type, model_config=model_config)
-        checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
-        if 'model_state_dict' in checkpoint:
-            model.load_state_dict(checkpoint['model_state_dict'])
-        else:
-            model.load_state_dict(checkpoint)
-        logger.info(f"Loaded model from: {checkpoint_path}")
-    return model, config
 
 def load_test_data(config, data_path: str = None, use_validation: bool = False):
     """Load test data for evaluation."""
@@ -169,6 +81,30 @@ def load_test_data(config, data_path: str = None, use_validation: bool = False):
 
 def create_test_dataset(config, data_loader, test_df):
     """Create test dataset(s) for all models in the config."""
+    # If ensemble, use JointEnsembleDataset and joint collate
+    if hasattr(config.model, 'type') and config.model.type == 'ensemble':
+        from src.models import JointEnsembleDataset, get_joint_ensemble_collate_fn
+        test_texts = test_df[config.data.text_column].astype(str).tolist()
+        test_labels = data_loader.label_encoder.transform(test_df[config.data.label_column].tolist())
+        test_dataset = JointEnsembleDataset(test_texts, test_labels)
+        # Build tokenizers for joint collate
+        from transformers import AutoTokenizer
+        tokenizers = {
+            'distilbert': AutoTokenizer.from_pretrained('distilbert-base-uncased'),
+            'twitter-roberta': AutoTokenizer.from_pretrained('cardiffnlp/twitter-roberta-base-emotion')
+        }
+        # Check for BiLSTM vocab
+        import os
+        vocab = None
+        for m in config.model.models:
+            if m['type'] == 'bilstm':
+                vocab_path = Path(config.paths.model_dir) / 'bilstm_vocab.json'
+                if vocab_path.exists():
+                    with open(vocab_path, 'r', encoding='utf-8') as f:
+                        vocab = json.load(f)
+                break
+        collate_fn = get_joint_ensemble_collate_fn(tokenizers, max_length=getattr(config.data, 'max_length', 128), vocab=vocab)
+        return test_dataset, collate_fn
     model_types = [m['type'] for m in config.model.models] if hasattr(config.model, 'models') else [config.model.type]
     tokenizers, vocabs = {}, {}
     from transformers import AutoTokenizer
@@ -226,10 +162,10 @@ def create_test_dataset(config, data_loader, test_df):
             vocab=vocabs['bilstm']
         )
     if len(datasets) == 1:
-        return list(datasets.values())[0], data_processor
-    return datasets, data_processor
+        return list(datasets.values())[0], None
+    return datasets, None
 
-def run_evaluation(model, config, test_dataset, device: str, output_dir: str, args):
+def run_evaluation(model, config, test_dataset, device: str, output_dir: str, args, collate_fn=None):
     """Run comprehensive evaluation."""
     evaluator = EmotionEvaluator(
         model=model,
@@ -237,48 +173,26 @@ def run_evaluation(model, config, test_dataset, device: str, output_dir: str, ar
         emotion_names=config.emotions,
         save_dir=output_dir
     )
-    def match_submodel_key(model_name, batch_keys):
-        candidates = [model_name,
-                      model_name.replace('-', '_'),
-                      model_name.replace('_', '-'),
-                      model_name.lower(),
-                      model_name.lower().replace('-', ''),
-                      model_name.lower().replace('_', ''),
-                      model_name.lower().replace('emotionmodel', ''),
-                      model_name.lower().replace('emotion', ''),
-                      model_name.lower().replace('model', '')]
-        for c in candidates:
-            for k in batch_keys:
-                if c == k or c in k or k in c:
-                    return k
-        return None
-    if isinstance(test_dataset, dict):
-        data_loader = EmotionDataLoader()
-        loaders = {k: data_loader.create_data_loaders({'test': ds}, batch_sizes={'test': args.batch_size})['test'] for k, ds in test_dataset.items()}
-        test_loader = zip(*(loaders[k] for k in test_dataset.keys()))
-        logger.info("Running evaluation (ensemble, multi-input)...")
+    # If using joint ensemble, use joint DataLoader and pass batches as-is
+    if hasattr(config.model, 'type') and config.model.type == 'ensemble' and isinstance(test_dataset, object) and not isinstance(test_dataset, dict):
+        from torch.utils.data import DataLoader
+        loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn)
+        logger.info("Running evaluation (joint ensemble, joint batch)...")
         all_predictions, all_probabilities, all_labels, all_texts = [], [], [], []
         model.eval()
         with torch.no_grad():
-            for batches in test_loader:
-                batch_dict = {}
-                labels = None
-                batch_keys = list(test_dataset.keys())
-                for i, (k, batch) in enumerate(zip(batch_keys, batches)):
-                    mapped_key = match_submodel_key(k, batch_keys)
-                    if 'attention_mask' in batch:
-                        batch_dict[mapped_key] = {
-                            'input_ids': batch['input_ids'].to(device),
-                            'attention_mask': batch['attention_mask'].to(device)
-                        }
+            for batch in loader:
+                labels = batch['labels'].to(device)
+                # Move submodel input dicts to device, keep labels at top level
+                batch_on_device = {}
+                for k, v in batch.items():
+                    if isinstance(v, dict):
+                        batch_on_device[k] = {kk: vv.to(device) for kk, vv in v.items()}
+                    elif k == 'labels':
+                        batch_on_device[k] = v.to(device)
                     else:
-                        batch_dict[mapped_key] = {
-                            'input_ids': batch['input_ids'].to(device)
-                        }
-                    if labels is None:
-                        labels = batch['label'].to(device)
-                batch_dict['labels'] = labels
-                outputs = model(**batch_dict)
+                        batch_on_device[k] = v
+                outputs = model(**batch_on_device)
                 logits = outputs['logits']
                 probabilities = torch.softmax(logits, dim=1)
                 predictions = torch.argmax(probabilities, dim=1)
@@ -306,7 +220,8 @@ def run_evaluation(model, config, test_dataset, device: str, output_dir: str, ar
             test_dataset.texts,
             test_dataset.labels,
             batch_size=args.batch_size,
-            max_length=getattr(config.data, 'max_length', 128)
+            max_length=getattr(config.data, 'max_length', 128),
+            debug_predictions=args.debug_predictions
         )
         model_name = getattr(model, 'name', model.__class__.__name__)
         evaluator.generate_evaluation_report(results, test_dataset.texts, test_dataset.labels, model_name=model_name)
@@ -319,7 +234,6 @@ def run_evaluation(model, config, test_dataset, device: str, output_dir: str, ar
         return results
 
 def main():
-    """Main evaluation function."""
     args = parse_args()
     logging_level = logging.DEBUG if args.verbose else logging.INFO
     logging.basicConfig(
@@ -327,18 +241,25 @@ def main():
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
     try:
-        model, config = load_model_and_config(args.model_path, args.config_path)
+        model, config, tokenizers, vocabs = load_model_and_assets(args.model_path, args.config_path)
         if args.force_cpu:
             config.device.force_cpu = True
         device = get_device_config(config)
         model = model.to(device)
         logger.info(f"Using device: {device}")
         data_loader, test_df = load_test_data(config, args.data_path, args.use_validation)
-        test_dataset, data_processor = create_test_dataset(config, data_loader, test_df)
-        results = run_evaluation(
-            model, config, test_dataset, device, args.output_dir, args
-        )
-        logger.info("Evaluation completed successfully!")
+        test_dataset, collate_fn = create_test_dataset(config, data_loader, test_df)
+        # --- Set output directory to evaluations/<model_dir_name>/ ---
+        from pathlib import Path
+        model_path = Path(args.model_path)
+        if model_path.is_file():
+            model_dir_name = model_path.parent.name
+        else:
+            model_dir_name = model_path.name
+        output_dir = Path(args.output_dir) / model_dir_name
+        output_dir.mkdir(parents=True, exist_ok=True)
+        run_evaluation(model, config, test_dataset, device, str(output_dir), args, collate_fn=collate_fn)
+        logger.info(f"Evaluation completed successfully! Results saved to: {output_dir}")
     except Exception as e:
         logger.error(f"Evaluation failed: {str(e)}")
         raise

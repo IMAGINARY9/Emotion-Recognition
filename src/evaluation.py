@@ -64,7 +64,8 @@ class EmotionEvaluator:
                       test_texts: List[str], 
                       test_labels: List[int],
                       batch_size: int = 32,
-                      max_length: int = 128) -> Dict:
+                      max_length: int = 128,
+                      debug_predictions: bool = False) -> Dict:
         """
         Comprehensive evaluation of the model.
         
@@ -73,6 +74,7 @@ class EmotionEvaluator:
             test_labels: Test labels
             batch_size: Batch size for evaluation
             max_length: Maximum sequence length
+            debug_predictions: Whether to enable debug predictions (if supported by the model)
             
         Returns:
             Dictionary containing all evaluation metrics
@@ -81,7 +83,7 @@ class EmotionEvaluator:
         
         # Get predictions
         predictions, probabilities, all_labels = self._get_predictions(
-            test_texts, test_labels, batch_size, max_length
+            test_texts, test_labels, batch_size, max_length, debug_predictions=debug_predictions
         )
         
         # Calculate metrics
@@ -133,7 +135,8 @@ class EmotionEvaluator:
                         texts: List[str], 
                         labels: List[int],
                         batch_size: int = 32,
-                        max_length: int = 128) -> Tuple[List[int], List[List[float]], List[int]]:
+                        max_length: int = 128,
+                        debug_predictions: bool = False) -> Tuple[List[int], List[List[float]], List[int]]:
         """
         Get model predictions for the given texts.
         
@@ -156,11 +159,17 @@ class EmotionEvaluator:
                     input_ids = batch['input_ids'].to(self.device)
                     attention_mask = batch['attention_mask'].to(self.device)
                     labels_batch = batch['label'].to(self.device)
-                    outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
+                    if hasattr(self.model, 'forward') and 'debug_predictions' in self.model.forward.__code__.co_varnames:
+                        outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, debug_predictions=debug_predictions)
+                    else:
+                        outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
                 else:
                     input_ids = batch['input_ids'].to(self.device)
                     labels_batch = batch['label'].to(self.device)
-                    outputs = self.model(input_ids=input_ids, attention_mask=None)
+                    if hasattr(self.model, 'forward') and 'debug_predictions' in self.model.forward.__code__.co_varnames:
+                        outputs = self.model(input_ids=input_ids, attention_mask=None, debug_predictions=debug_predictions)
+                    else:
+                        outputs = self.model(input_ids=input_ids, attention_mask=None)
                 logits = outputs['logits']
                 probabilities = F.softmax(logits, dim=-1)
                 predictions = torch.argmax(logits, dim=-1)

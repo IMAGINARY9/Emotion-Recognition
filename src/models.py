@@ -16,8 +16,9 @@ from torch.utils.data import Dataset
 from transformers import AutoModel, AutoConfig, AutoTokenizer
 from typing import Dict, List, Optional, Tuple, Union
 import numpy as np
-from sklearn.metrics import accuracy_score, classification_report
+from sklearn.metrics import accuracy_score, classification_report, f1_score
 from torch.nn.utils.rnn import pad_sequence
+import itertools
 
 class EmotionDataset(Dataset):
     """Dataset class for emotion recognition."""
@@ -278,12 +279,10 @@ class EnsembleEmotionModel(nn.Module):
     Combines transformer models with traditional models and lexicon-based approaches.
     """
     
-    def __init__(self, models: List[nn.Module], weights: Optional[List[float]] = None):
+    def __init__(self, models: List[nn.Module], weights: Optional[List[float]] = None, label_names: Optional[List[str]] = None):
         super().__init__()
-        # Only keep models that are not None (in case BiLSTM is removed from config)
         self.models = nn.ModuleList([m for m in models if m is not None])
         if weights is not None:
-            # Only keep weights for present models
             if len(weights) != len(models):
                 print("[Ensemble Warning] Number of weights does not match number of models. Using equal weights.")
                 self.weights = [1.0 / len(self.models)] * len(self.models)
@@ -292,17 +291,25 @@ class EnsembleEmotionModel(nn.Module):
                 self.weights = [float(w) / total for w in weights]
         else:
             self.weights = [1.0 / len(self.models)] * len(self.models)
-    
-    def forward(self, **inputs) -> Dict[str, torch.Tensor]:
-        """Forward pass through ensemble."""
+        # Add label names for debug output
+        self.label_names = label_names or ['sadness', 'joy', 'love', 'anger', 'fear', 'surprise']
+
+    def _idx_to_label(self, idx_tensor):
+        # idx_tensor: torch.Tensor of indices
+        if isinstance(idx_tensor, torch.Tensor):
+            return [self.label_names[i] if 0 <= i < len(self.label_names) else str(i) for i in idx_tensor.cpu().tolist()]
+        return str(idx_tensor)
+
+    def forward(self, debug_predictions: bool = False, **inputs) -> Dict[str, torch.Tensor]:
+        """Forward pass through ensemble.
+        Args:
+            debug_predictions: If True, print [Ensemble Debug] prediction/logit info for each model and ensemble output.
+        """
         logits_list = []
         successful_indices = []
-        
         for i, model in enumerate(self.models):
             try:
-                # Robust mapping from model class to input key
                 model_name = type(model).__name__.lower()
-                # Accept both hyphen and underscore keys for robustness
                 if 'distilbert' in model_name:
                     for key in ['distilbert', 'distilbert-emotion', 'distilbert_emotion']:
                         if key in inputs:
@@ -332,44 +339,39 @@ class EnsembleEmotionModel(nn.Module):
             except Exception as e:
                 print(f"[Ensemble Warning] Model {i} failed: {e}")
                 continue
-        
         if not logits_list:
             raise RuntimeError("No models in ensemble could process the inputs")
-        
-        # Use only weights for successful models and renormalize
         successful_weights = [self.weights[i] for i in successful_indices]
         total_weight = sum(successful_weights)
         normalized_weights = [w / total_weight for w in successful_weights]
-        
-        # Debug: print individual model predictions and logits
-        with torch.no_grad():
-            for i, (logits, weight) in enumerate(zip(logits_list, normalized_weights)):
-                preds = torch.argmax(logits, dim=-1)
-                sample_logits = logits[0] if logits.shape[0] > 0 else logits
-                print(f"[Ensemble Debug] Model {successful_indices[i]} predictions: {preds[:5]}, logits[0]: {sample_logits}, weight: {weight:.3f}")
-        
-        # Weighted average of logits
+        # Debug: print individual model predictions and logits (with mapped labels)
+        if debug_predictions:
+            with torch.no_grad():
+                for i, (logits, weight) in enumerate(zip(logits_list, normalized_weights)):
+                    preds = torch.argmax(logits, dim=-1)
+                    sample_logits = logits[0] if logits.shape[0] > 0 else logits
+                    pred_labels = self._idx_to_label(preds[:5])
+                    print(f"[Ensemble Debug] Model {successful_indices[i]} predictions: {preds[:5]} ({pred_labels}), logits[0]: {sample_logits}, weight: {weight:.3f}")
         weighted_logits = torch.zeros_like(logits_list[0])
         for weight, logits in zip(normalized_weights, logits_list):
             weighted_logits += weight * logits
-        
         result = {'logits': weighted_logits}
-        
         if 'labels' in inputs and inputs['labels'] is not None:
             loss_fct = nn.CrossEntropyLoss()
             loss = loss_fct(weighted_logits, inputs['labels'])
             result['loss'] = loss
-        
-        # Debug: check if all predictions are for a single class
-        with torch.no_grad():
-            preds = torch.argmax(weighted_logits, dim=-1)
-            unique = torch.unique(preds)
-            sample_weighted_logits = weighted_logits[0] if weighted_logits.shape[0] > 0 else weighted_logits
-            print(f"[Ensemble Debug] Final weighted logits[0]: {sample_weighted_logits}")
-            print(f"[Ensemble Debug] Final ensemble predictions: {preds[:5]}, unique classes: {unique}")
-            if unique.numel() == 1:
-                print(f"[Ensemble Warning] All ensemble predictions are for class {unique.item()} in this batch.")
-        
+        # Debug: check if all predictions are for a single class (with mapped label)
+        if debug_predictions:
+            with torch.no_grad():
+                preds = torch.argmax(weighted_logits, dim=-1)
+                unique = torch.unique(preds)
+                sample_weighted_logits = weighted_logits[0] if weighted_logits.shape[0] > 0 else weighted_logits
+                pred_labels = self._idx_to_label(preds[:5])
+                unique_labels = self._idx_to_label(unique)
+                print(f"[Ensemble Debug] Final weighted logits[0]: {sample_weighted_logits}")
+                print(f"[Ensemble Debug] Final ensemble predictions: {preds[:5]} ({pred_labels}), unique classes: {unique} ({unique_labels})")
+                if unique.numel() == 1:
+                    print(f"[Ensemble Warning] All ensemble predictions are for class {unique.item()} ({unique_labels[0]}) in this batch.")
         return result
 
 class EmotionPredictor:
@@ -391,13 +393,14 @@ class EmotionPredictor:
         self.model.to(device)
         self.model.eval()
     
-    def predict(self, texts: Union[str, List[str]], return_probabilities: bool = False) -> Union[Dict, List[Dict]]:
+    def predict(self, texts: Union[str, List[str]], return_probabilities: bool = False, debug_predictions: bool = False) -> Union[Dict, List[Dict]]:
         """
         Predict emotions for input text(s).
         
         Args:
             texts: Input text or list of texts
             return_probabilities: Whether to return class probabilities
+            debug_predictions: Whether to print ensemble debug info (if supported)
             
         Returns:
             Prediction results with emotions and optionally probabilities
@@ -405,53 +408,84 @@ class EmotionPredictor:
         is_single = isinstance(texts, str)
         if is_single:
             texts = [texts]
-            
         # Preprocess texts if preprocessor is available
         if self.preprocessor:
             texts = [self.preprocessor.preprocess_text(text) for text in texts]
-            
         results = []
-        
+        # --- ENSEMBLE-aware prediction batching ---
+        if hasattr(self.model, 'models') and isinstance(self.model, nn.Module):
+            # Always build tokenizers dict with both keys
+            tokenizers = {
+                'distilbert': None,
+                'twitter-roberta': None
+            }
+            if hasattr(self.tokenizer, 'name_or_path'):
+                if 'distilbert' in self.tokenizer.name_or_path.lower():
+                    tokenizers['distilbert'] = self.tokenizer
+                elif 'roberta' in self.tokenizer.name_or_path.lower():
+                    tokenizers['twitter-roberta'] = self.tokenizer
+                else:
+                    # Fallback: assign to both
+                    tokenizers['distilbert'] = self.tokenizer
+                    tokenizers['twitter-roberta'] = self.tokenizer
+            # Try to get vocab for BiLSTM if present
+            vocab = getattr(self.model, 'vocab', None)
+            try:
+                from src.models import get_joint_ensemble_collate_fn
+            except ImportError:
+                from .models import get_joint_ensemble_collate_fn
+            collate_fn = get_joint_ensemble_collate_fn(tokenizers, max_length=128, vocab=vocab)
+            batch = [{'text': t, 'label': 0} for t in texts]  # dummy label
+            batch_dict = collate_fn(batch)
+            # Remove 'labels' key for prediction
+            batch_dict = {k: v for k, v in batch_dict.items() if k != 'labels'}
+            # Remove submodel keys where value is None
+            batch_dict = {k: (None if v is None else {kk: vv.to(self.device) for kk, vv in v.items()}) for k, v in batch_dict.items() if v is not None}
+            with torch.no_grad():
+                if 'debug_predictions' in self.model.forward.__code__.co_varnames:
+                    output = self.model(**batch_dict, debug_predictions=debug_predictions)
+                else:
+                    output = self.model(**batch_dict)
+                logits = output['logits']
+                probabilities = F.softmax(logits, dim=-1)
+                for i, text in enumerate(texts):
+                    predicted_class = torch.argmax(logits[i]).item()
+                    predicted_emotion = self.label_names[predicted_class]
+                    confidence = probabilities[i, predicted_class].item()
+                    result = {
+                        'text': text,
+                        'emotion': predicted_emotion,
+                        'confidence': confidence
+                    }
+                    if return_probabilities:
+                        prob_dict = {
+                            emotion: prob.item() 
+                            for emotion, prob in zip(self.label_names, probabilities[i])
+                        }
+                        result['probabilities'] = prob_dict
+                    results.append(result)
+            return results[0] if is_single else results
+        # --- Single model prediction ---
         with torch.no_grad():
             for text in texts:
-                # Tokenize
-                encoding = self.tokenizer(
-                    text,
-                    truncation=True,
-                    padding='max_length',
-                    max_length=128,
-                    return_tensors='pt'
-                )
-                
-                # Move to device
-                input_ids = encoding['input_ids'].to(self.device)
-                attention_mask = encoding['attention_mask'].to(self.device)
-                
-                # Predict
-                outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
-                logits = outputs['logits']
+                output = self.model(text=[text], debug_predictions=debug_predictions) if 'debug_predictions' in self.model.forward.__code__.co_varnames else self.model(text=[text])
+                logits = output['logits']
                 probabilities = F.softmax(logits, dim=-1)
-                
-                # Get prediction
                 predicted_class = torch.argmax(logits, dim=-1).item()
                 predicted_emotion = self.label_names[predicted_class]
                 confidence = probabilities[0, predicted_class].item()
-                
                 result = {
                     'text': text,
                     'emotion': predicted_emotion,
                     'confidence': confidence
                 }
-                
                 if return_probabilities:
                     prob_dict = {
                         emotion: prob.item() 
                         for emotion, prob in zip(self.label_names, probabilities[0])
                     }
                     result['probabilities'] = prob_dict
-                    
                 results.append(result)
-        
         return results[0] if is_single else results
 
 def create_model(model_type: str, model_config: Dict) -> nn.Module:
@@ -476,3 +510,122 @@ def create_model(model_type: str, model_config: Dict) -> nn.Module:
         return EnsembleEmotionModel(**model_config)
     else:
         raise ValueError(f"Unknown model type: {model_type}")
+
+def move_to_device(batch, device):
+    """
+    Recursively move all tensors in a batch (possibly nested dicts) to the specified device.
+    """
+    if isinstance(batch, torch.Tensor):
+        return batch.to(device)
+    elif isinstance(batch, dict):
+        return {k: move_to_device(v, device) for k, v in batch.items()}
+    elif isinstance(batch, list):
+        return [move_to_device(v, device) for v in batch]
+    else:
+        return batch
+
+def calibrate_ensemble_weights(ensemble_model, val_loader, device='cpu', metric='f1_macro', step=0.1, verbose=True):
+    """
+    Calibrate ensemble weights using grid search on a validation set.
+    Args:
+        ensemble_model: EnsembleEmotionModel instance
+        val_loader: DataLoader for validation set
+        device: Device to run evaluation
+        metric: Metric to optimize ('f1_macro' or 'accuracy')
+        step: Step size for grid search (e.g., 0.1)
+        verbose: Print progress
+    Returns:
+        best_weights: List of calibrated weights
+        best_score: Best metric score
+    """
+    n_models = len(ensemble_model.models)
+    # Generate all possible weight combinations that sum to 1
+    grid = [w for w in itertools.product(
+        *( [ [i*step for i in range(int(1/step)+1)] ] * n_models ) )
+        if abs(sum(w)-1.0) < 1e-6 and all(x > 0 for x in w)
+    ]
+    best_score = -1
+    best_weights = None
+    y_true_all, y_pred_all = [], []
+    for weights in grid:
+        ensemble_model.weights = list(weights)
+        y_true, y_pred = [], []
+        for batch in val_loader:
+            # Move all tensors in batch to device, handle nested dicts for joint ensemble
+            batch_on_device = move_to_device(batch, device)
+            # Remove 'labels' from inputs, keep for y_true
+            inputs = {k: v for k, v in batch_on_device.items() if k != 'labels'}
+            labels = batch_on_device['labels']
+            with torch.no_grad():
+                logits = ensemble_model(**inputs)['logits']
+                preds = torch.argmax(logits, dim=-1)
+            y_true.extend(labels.cpu().numpy())
+            y_pred.extend(preds.cpu().numpy())
+        if metric == 'f1_macro':
+            score = f1_score(y_true, y_pred, average='macro')
+        else:
+            score = accuracy_score(y_true, y_pred)
+        if verbose:
+            print(f"[Calibration] Weights: {weights}, {metric}: {score:.4f}")
+        if score > best_score:
+            best_score = score
+            best_weights = list(weights)
+    if verbose:
+        print(f"[Calibration] Best weights: {best_weights}, best {metric}: {best_score:.4f}")
+    ensemble_model.weights = best_weights
+    return best_weights, best_score
+
+class JointEnsembleDataset(Dataset):
+    """
+    Dataset for joint ensemble training. Returns raw text and label for each sample.
+    Tokenization is handled in the collate_fn for each submodel.
+    """
+    def __init__(self, texts, labels):
+        self.texts = texts
+        self.labels = labels
+    def __len__(self):
+        return len(self.texts)
+    def __getitem__(self, idx):
+        return {'text': self.texts[idx], 'label': self.labels[idx]}
+
+def get_joint_ensemble_collate_fn(tokenizers, max_length=128, vocab=None):
+    """
+    Returns a collate_fn that tokenizes a batch for each submodel.
+    tokenizers: dict with keys 'distilbert', 'twitter-roberta', etc.
+    vocab: for bilstm, a vocab dict.
+    """
+    def collate_fn(batch):
+        texts = [item['text'] for item in batch]
+        labels = torch.tensor([item['label'] for item in batch], dtype=torch.long)
+        batch_dict = {'labels': labels}
+        # DistilBERT
+        if 'distilbert' in tokenizers:
+            enc = tokenizers['distilbert'](
+                texts, truncation=True, padding='max_length', max_length=max_length, return_tensors='pt'
+            )
+            batch_dict['distilbert'] = {'input_ids': enc['input_ids'], 'attention_mask': enc['attention_mask']}
+        else:
+            # Always provide the key for ensemble robustness
+            batch_dict['distilbert'] = None
+        # Twitter-RoBERTa
+        if 'twitter-roberta' in tokenizers:
+            enc = tokenizers['twitter-roberta'](
+                texts, truncation=True, padding='max_length', max_length=max_length, return_tensors='pt'
+            )
+            batch_dict['twitter-roberta'] = {'input_ids': enc['input_ids'], 'attention_mask': enc['attention_mask']}
+        else:
+            batch_dict['twitter-roberta'] = None
+        # BiLSTM
+        if vocab is not None:
+            input_ids = []
+            for text in texts:
+                tokens = text.split()
+                ids = [vocab.get(tok, vocab.get('<UNK>', 1)) for tok in tokens][:max_length]
+                ids += [vocab.get('<PAD>', 0)] * (max_length - len(ids))
+                input_ids.append(ids)
+            batch_dict['bilstm'] = {'input_ids': torch.tensor(input_ids, dtype=torch.long)}
+        else:
+            batch_dict['bilstm'] = None
+
+        return batch_dict
+    return collate_fn
