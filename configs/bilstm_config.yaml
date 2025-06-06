@@ -4,11 +4,11 @@ model:
   type: "bilstm"
   vocab_size: 12678
   embedding_dim: 300
-  hidden_dim: 128
-  num_layers: 2
+  hidden_dim: 512  # Increased hidden size for more capacity
+  num_layers: 3    # More layers for deeper learning
   num_classes: 6
-  dropout_rate: 0.5
-  max_length: 128
+  dropout_rate: 0.2  # Lower dropout for BiLSTM
+  max_length: 256   # Allow longer sequences
   bidirectional: true
   attention: true
   
@@ -18,12 +18,19 @@ model:
     path: null  # Will use GloVe 300d if available
     freeze: false
     
+  # Loss function
+  loss_type: focal  # Options: 'cross_entropy', 'focal'
+  gamma: 2.0        # Focal loss focusing parameter
+  label_smoothing: 0.0  # Label smoothing for loss
+  freeze: false     # Ensure embeddings are trainable
+    
 training:
   batch_size: 64
-  learning_rate: 0.001
-  num_epochs: 20
+  learning_rate: 0.001  # Higher learning rate for BiLSTM
+  optimizer: adamw      # Use AdamW optimizer
+  num_epochs: 30
   warmup_steps: 0
-  weight_decay: 1e-4
+  weight_decay: 0.0     # No weight decay for BiLSTM
   gradient_clip_norm: 5.0
   
   # Learning rate scheduler
@@ -35,7 +42,7 @@ training:
   # Early stopping
   early_stopping:
     enabled: true
-    patience: 5
+    patience: 7  # More patience for early stopping
     min_delta: 0.001
     metric: "val_f1"
     mode: "max"

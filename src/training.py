@@ -13,6 +13,7 @@ from torch.optim import AdamW
 from transformers.optimization import get_linear_schedule_with_warmup
 from transformers import AutoTokenizer
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, classification_report
+from sklearn.utils.multiclass import unique_labels
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -26,6 +27,7 @@ from datetime import datetime
 
 from models import EmotionDataset, create_model
 from preprocessing import EmotionPreprocessor
+from src.losses import FocalLoss
 
 class EmotionTrainer:
     """
@@ -42,7 +44,10 @@ class EmotionTrainer:
                  gradient_clipping: float = 1.0,
                  save_dir: str = 'models',
                  emotion_names: List[str] = None,
-                 class_weights: torch.Tensor = None):
+                 class_weights: torch.Tensor = None,
+                 loss_type: str = 'cross_entropy',
+                 gamma: float = 2.0,
+                 label_smoothing: float = 0.0):
         """
         Initialize the trainer.
         
@@ -57,6 +62,9 @@ class EmotionTrainer:
             save_dir: Directory to save models
             emotion_names: List of emotion names
             class_weights: Tensor of class weights for imbalanced data (computed from training set)
+            loss_type: Loss function type ('cross_entropy' or 'focal')
+            gamma: Focal loss gamma
+            label_smoothing: Label smoothing for loss
         """
         self.model = model.to(device)
         self.tokenizer = tokenizer
@@ -66,7 +74,7 @@ class EmotionTrainer:
         self.warmup_steps = warmup_steps
         self.gradient_clipping = gradient_clipping
         self.save_dir = Path(save_dir)
-        self.save_dir.mkdir(exist_ok=True)
+        self.save_dir.mkdir(parents=True, exist_ok=True)
         
         self.emotion_names = emotion_names or ['sadness', 'joy', 'love', 'anger', 'fear', 'surprise']
         self.class_weights = class_weights
@@ -84,20 +92,36 @@ class EmotionTrainer:
         # Setup logging
         self.setup_logging()
         
-    def setup_logging(self):
-        """Setup logging for training."""
-        log_dir = Path('logs')
-        log_dir.mkdir(exist_ok=True)
+        # Loss function configuration
+        self.loss_type = loss_type
+        self.gamma = gamma
+        self.label_smoothing = label_smoothing
         
-        logging.basicConfig(
-            level=logging.INFO,
-            format='%(asctime)s - %(levelname)s - %(message)s',
-            handlers=[
-                logging.FileHandler(log_dir / f'training_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log'),
-                logging.StreamHandler()
-            ]
-        )
-        self.logger = logging.getLogger(__name__)
+    def setup_logging(self):
+        """Setup logging for training (dedicated file handler per trainer instance)."""
+        log_dir = Path('logs')
+        log_dir.mkdir(parents=True, exist_ok=True)
+        # Unique log file per trainer instance
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        model_name = getattr(self.model, 'name', self.model.__class__.__name__)
+        log_file = log_dir / f"training_{model_name}_{timestamp}.log"
+        self.logger = logging.getLogger(f"EmotionTrainer.{id(self)}")
+        self.logger.setLevel(logging.INFO)
+        # Remove existing handlers to avoid duplicate logs
+        self.logger.handlers = []
+        file_handler = logging.FileHandler(log_file, mode='a', encoding='utf-8')
+        file_handler.setLevel(logging.INFO)
+        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        file_handler.setFormatter(formatter)
+        self.logger.addHandler(file_handler)
+        # Also add a stream handler for console output
+        stream_handler = logging.StreamHandler()
+        stream_handler.setLevel(logging.INFO)
+        stream_handler.setFormatter(formatter)
+        self.logger.addHandler(stream_handler)
+        # Prevent log propagation to root logger
+        self.logger.propagate = False
+        self.logger.info(f"Logging started for EmotionTrainer. Log file: {log_file}")
     
     def create_data_loaders(self, 
                            train_texts: List[str], 
@@ -182,9 +206,14 @@ class EmotionTrainer:
                         outputs = self.model(input_ids=input_ids, labels=labels)
             
             # Use class weights if available
-            if self.class_weights is not None:
-                loss_fct = nn.CrossEntropyLoss(weight=self.class_weights)
+            if self.class_weights is not None and self.loss_type == 'cross_entropy':
+                loss_fct = nn.CrossEntropyLoss(weight=self.class_weights, label_smoothing=self.label_smoothing)
                 loss = loss_fct(outputs['logits'], labels)
+            elif self.class_weights is not None and self.loss_type == 'focal':
+                loss_fct = FocalLoss(gamma=self.gamma, weight=self.class_weights, label_smoothing=self.label_smoothing)
+                loss = loss_fct(outputs['logits'], labels)
+            elif hasattr(self.model, 'loss_fct'):
+                loss = self.model.loss_fct(outputs['logits'], labels)
             else:
                 loss = outputs['loss']
             logits = outputs['logits']
@@ -272,9 +301,14 @@ class EmotionTrainer:
                         else:
                             outputs = self.model(input_ids=input_ids, labels=labels)
                 # Use class weights if available
-                if self.class_weights is not None:
-                    loss_fct = nn.CrossEntropyLoss(weight=self.class_weights)
+                if self.class_weights is not None and self.loss_type == 'cross_entropy':
+                    loss_fct = nn.CrossEntropyLoss(weight=self.class_weights, label_smoothing=self.label_smoothing)
                     loss = loss_fct(outputs['logits'], labels)
+                elif self.class_weights is not None and self.loss_type == 'focal':
+                    loss_fct = FocalLoss(gamma=self.gamma, weight=self.class_weights, label_smoothing=self.label_smoothing)
+                    loss = loss_fct(outputs['logits'], labels)
+                elif hasattr(self.model, 'loss_fct'):
+                    loss = self.model.loss_fct(outputs['logits'], labels)
                 else:
                     loss = outputs['loss']
                 logits = outputs['logits']
@@ -287,9 +321,9 @@ class EmotionTrainer:
         # Calculate metrics
         avg_loss = total_loss / len(val_loader)
         accuracy = accuracy_score(all_labels, all_predictions)
-        f1 = f1_score(all_labels, all_predictions, average='weighted')
-        precision = precision_score(all_labels, all_predictions, average='weighted')
-        recall = recall_score(all_labels, all_predictions, average='weighted')
+        f1 = f1_score(all_labels, all_predictions, average='weighted', zero_division=0)
+        precision = precision_score(all_labels, all_predictions, average='weighted', zero_division=0)
+        recall = recall_score(all_labels, all_predictions, average='weighted', zero_division=0)
         
         # Log prediction distribution
         unique, counts = np.unique(all_predictions, return_counts=True)
@@ -307,7 +341,8 @@ class EmotionTrainer:
             'classification_report': classification_report(
                 all_labels, all_predictions, 
                 target_names=self.emotion_names,
-                output_dict=True
+                output_dict=True,
+                zero_division=0
             ),
             'prediction_distribution': pred_dist
         }
@@ -332,6 +367,19 @@ class EmotionTrainer:
         If train_loader/val_loader are provided, use them directly (for joint ensemble training).
         Otherwise, create DataLoaders from texts/labels (for individual training).
         """
+        # Log class distribution and weights
+        if train_texts is not None and train_labels is not None:
+            unique, counts = np.unique(train_labels, return_counts=True)
+            class_dist = dict(zip(unique, counts))
+            self.logger.info(f"Training set class distribution: {class_dist}")
+            if len(class_dist) > 1:
+                max_count = max(counts)
+                min_count = min(counts)
+                if max_count > 10 * min_count:
+                    self.logger.warning(f"Severe class imbalance detected: max/min ratio > 10. Consider upsampling, downsampling, or using stronger class weights.")
+        if self.class_weights is not None:
+            self.logger.info(f"Class weights for loss: {self.class_weights.cpu().numpy().tolist()}")
+        
         self.logger.info(f"Starting training with {num_epochs} epochs")
         if train_loader is None or val_loader is None:
             self.logger.info("Creating DataLoaders from texts/labels (individual training mode)")

@@ -201,21 +201,15 @@ def run_evaluation(model, config, test_dataset, device: str, output_dir: str, ar
                 all_labels.extend(labels.cpu().numpy())
                 batch_size = len(labels)
                 all_texts.extend([f"text_{i}" for i in range(len(all_texts), len(all_texts) + batch_size)])
+        # Only calculate metrics and return, do not save reports/plots here
         results = evaluator._calculate_metrics(all_labels, all_predictions, all_probabilities)
         from sklearn.metrics import confusion_matrix, classification_report
         results['confusion_matrix'] = confusion_matrix(all_labels, all_predictions)
         results['classification_report'] = classification_report(all_labels, all_predictions, target_names=config.emotions, output_dict=True, zero_division=0)
         results['error_analysis'] = evaluator._perform_error_analysis(all_texts, all_labels, all_predictions, all_probabilities)
-        model_name = getattr(model, 'name', model.__class__.__name__)
-        evaluator.generate_evaluation_report(results, all_texts, all_labels, model_name=model_name)
-        cm_path = Path(output_dir) / f"confusion_matrix_{model_name}.png"
-        evaluator.plot_confusion_matrix(results['confusion_matrix'], save_path=str(cm_path))
-        pcm_path = Path(output_dir) / f"per_class_metrics_{model_name}.png"
-        evaluator.plot_per_class_metrics(results, save_path=str(pcm_path))
-        tsne_path = Path(output_dir) / f"embeddings_tsne_{model_name}.png"
-        evaluator.visualize_embeddings(all_texts, all_labels, save_path=str(tsne_path))
         return results
     else:
+        # Only call evaluate_model, which handles all saving
         results = evaluator.evaluate_model(
             test_dataset.texts,
             test_dataset.labels,
@@ -223,14 +217,6 @@ def run_evaluation(model, config, test_dataset, device: str, output_dir: str, ar
             max_length=getattr(config.data, 'max_length', 128),
             debug_predictions=args.debug_predictions
         )
-        model_name = getattr(model, 'name', model.__class__.__name__)
-        evaluator.generate_evaluation_report(results, test_dataset.texts, test_dataset.labels, model_name=model_name)
-        cm_path = Path(output_dir) / f"confusion_matrix_{model_name}.png"
-        evaluator.plot_confusion_matrix(results['confusion_matrix'], save_path=str(cm_path))
-        pcm_path = Path(output_dir) / f"per_class_metrics_{model_name}.png"
-        evaluator.plot_per_class_metrics(results, save_path=str(pcm_path))
-        tsne_path = Path(output_dir) / f"embeddings_tsne_{model_name}.png"
-        evaluator.visualize_embeddings(test_dataset.texts, test_dataset.labels, save_path=str(tsne_path))
         return results
 
 def main():
@@ -249,14 +235,14 @@ def main():
         logger.info(f"Using device: {device}")
         data_loader, test_df = load_test_data(config, args.data_path, args.use_validation)
         test_dataset, collate_fn = create_test_dataset(config, data_loader, test_df)
-        # --- Set output directory to evaluations/<model_dir_name>/ ---
+        # --- Set output directory to reports/<model_dir_name>/ ---
         from pathlib import Path
         model_path = Path(args.model_path)
         if model_path.is_file():
             model_dir_name = model_path.parent.name
         else:
             model_dir_name = model_path.name
-        output_dir = Path(args.output_dir) / model_dir_name
+        output_dir = Path("reports") / model_dir_name
         output_dir.mkdir(parents=True, exist_ok=True)
         run_evaluation(model, config, test_dataset, device, str(output_dir), args, collate_fn=collate_fn)
         logger.info(f"Evaluation completed successfully! Results saved to: {output_dir}")

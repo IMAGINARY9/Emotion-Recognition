@@ -7,6 +7,7 @@ models with different architectures and configurations.
 """
 
 import torch
+import pandas as pd
 
 import argparse
 from pathlib import Path
@@ -18,6 +19,7 @@ if project_root not in sys.path:
 from datetime import datetime
 from collections import Counter
 import os
+import json
 import logging
 
 # Add src to path
@@ -138,26 +140,39 @@ def load_and_prepare_data(config, data_path: str = None, use_sample: bool = Fals
 
     return data_loader, train_df, val_df, test_df
 
-def create_datasets(config, data_loader, train_df, val_df, test_df):
+def create_datasets(config, data_loader, train_df, val_df, test_df, models_dir=None, upsample_minority=True):
     """Create PyTorch datasets."""
     from src.models import JointEnsembleDataset
-    # Initialize preprocessor
     preprocessor = EmotionPreprocessor(
         handle_emojis=config.preprocessing.get('emoji_handling', 'convert'),
         expand_contractions=config.preprocessing.get('expand_contractions', True),
         remove_stopwords=config.preprocessing.get('remove_stopwords', False),
         lemmatize=config.preprocessing.get('lemmatize', False),
         normalize_case=config.preprocessing.get('lowercase', True),
-        handle_social_media=True,  # Always handle social media artifacts
+        handle_social_media=True,
         min_length=3,
         max_length=config.data.get('max_length', 128)
     )
-    # Create data processor
     data_processor = EmotionDataProcessor(preprocessor=preprocessor)
-    # Preprocess all splits
     processed_train, processed_val, processed_test = data_processor.process_emotion_dataset(
         train_df, val_df, test_df, text_column=config.data.text_column, label_column=config.data.label_column
     )
+    # --- Optional: Upsample minority classes in train set ---
+    if upsample_minority and not processed_train.empty:
+        from sklearn.utils import resample
+        label_col = config.data.label_column
+        class_counts = processed_train[label_col].value_counts()
+        max_count = class_counts.max()
+        dfs = []
+        for label in class_counts.index:
+            df_label = processed_train[processed_train[label_col] == label]
+            if len(df_label) < max_count:
+                df_label_upsampled = resample(df_label, replace=True, n_samples=max_count, random_state=42)
+                dfs.append(df_label_upsampled)
+            else:
+                dfs.append(df_label)
+        processed_train = pd.concat(dfs).sample(frac=1, random_state=42).reset_index(drop=True)
+        logger.info(f"Upsampled training set to {len(processed_train)} samples (per-class: {max_count})")
     # --- BiLSTM-specific: Build vocab and tokenizer ---
     use_bilstm = any(m['type'] == 'bilstm' for m in getattr(config.model, 'models', [])) or getattr(config.model, 'type', None) == 'bilstm'
     bilstm_tokenizer = None
@@ -173,13 +188,12 @@ def create_datasets(config, data_loader, train_df, val_df, test_df):
         def bilstm_tokenizer_fn(text):
             return [vocab.get(tok, vocab.get('<UNK>', 1)) for tok in text.split()]
         bilstm_tokenizer = bilstm_tokenizer_fn
-        # --- Save BiLSTM vocab after building ---
-        output_dir = getattr(config.paths, 'output_dir', None)
-        if output_dir:
-            import json
-            Path(output_dir).mkdir(parents=True, exist_ok=True)
-            vocab_path = Path(output_dir) / "bilstm_vocab.json"
+        # --- Save BiLSTM vocab in models_dir if provided ---
+        if models_dir:
+            Path(models_dir).mkdir(parents=True, exist_ok=True)
+            vocab_path = Path(models_dir) / "bilstm_vocab.json"
             with open(vocab_path, "w", encoding="utf-8") as f:
+                import json
                 json.dump(vocab, f)
             logger.info(f"Saved BiLSTM vocab to {vocab_path}")
     # Joint training: use JointEnsembleDataset
@@ -418,12 +432,6 @@ def train_model(config, datasets, device: str, output_dir: str, vocab=None, data
     with open(history_path, 'w') as f:
         json.dump(training_history, f, indent=2)
     logger.info(f"Training completed. Model saved to: {output_dir}")
-    # After vocab is built and output_dir is known:
-    if vocab is not None:
-        vocab_path = Path(output_dir) / "bilstm_vocab.json"
-        with open(vocab_path, "w", encoding="utf-8") as f:
-            json.dump(vocab, f)
-        logger.info(f"Saved BiLSTM vocab to {vocab_path}")
     return trainer, training_history
 
 def evaluate_model(config, trainer, datasets, device: str, output_dir: str, debug_predictions: bool = False):
@@ -438,7 +446,8 @@ def evaluate_model(config, trainer, datasets, device: str, output_dir: str, debu
     evaluator = EmotionEvaluator(
         model=trainer.model,
         device=device,
-        emotion_names=config.emotions
+        emotion_names=config.emotions,
+        save_dir=output_dir
     )
     
     # Evaluate on test set if available
@@ -452,18 +461,6 @@ def evaluate_model(config, trainer, datasets, device: str, output_dir: str, debu
             max_length=config.data.get('max_length', 128),
             debug_predictions=debug_predictions
         )
-
-        # Generate report
-        report_path = evaluator.generate_evaluation_report(
-            results, test_texts, test_labels, model_name=config.model.type
-        )
-
-        # Create visualizations
-        if config.evaluation.get('plot_confusion_matrix', True):
-            evaluator.plot_confusion_matrix(results['confusion_matrix'], save_path=os.path.join(output_dir, 'confusion_matrix.png'))
-
-        if config.evaluation.get('plot_embeddings', True):
-            evaluator.visualize_embeddings(test_texts, test_labels, save_path=os.path.join(output_dir, 'embeddings_tsne.png'))
 
         logger.info(f"Evaluation completed. Results saved to: {output_dir}")
         return results
@@ -566,16 +563,22 @@ def main():
     logger.info(f"Using device: {device}")
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     experiment_name = args.experiment_name or f"{config.model.type}_{timestamp}"
-    output_dir = Path(config.paths.output_dir) / experiment_name
-    output_dir.mkdir(parents=True, exist_ok=True)
+    # --- Output directory structure ---
+    models_dir = Path("models") / experiment_name
+    reports_dir = Path("reports") / experiment_name
+    logs_dir = Path("logs")
+    for d in [models_dir, reports_dir, logs_dir]:
+        d.mkdir(parents=True, exist_ok=True)
     logger.info(f"Experiment: {experiment_name}")
-    logger.info(f"Output directory: {output_dir}")
-    config_path = output_dir / "config.yaml"
+    logger.info(f"Model dir: {models_dir}")
+    logger.info(f"Reports dir: {reports_dir}")
+    logger.info(f"Logs dir: {logs_dir}")
+    config_path = models_dir / "config.yaml"
     config_manager.save_config(config, config_path)
     try:
         # --- Data Preparation ---
         data_loader, train_df, val_df, test_df = load_and_prepare_data(config, args.data_path, args.use_sample_data)
-        datasets, data_processor, vocab = create_datasets(config, data_loader, train_df, val_df, test_df)
+        datasets, data_processor, vocab = create_datasets(config, data_loader, train_df, val_df, test_df, models_dir=models_dir)
         # --- Training ---
         if getattr(config.model, 'type', None) == 'ensemble':
             strategy = getattr(config.training, 'strategy', 'joint')
@@ -586,7 +589,7 @@ def main():
                 # Train each submodel separately and save assets
                 for i, sub_cfg in enumerate(config.model.models):
                     sub_type = sub_cfg['type'].replace('_', '-')
-                    sub_dir = output_dir / f"{sub_type}_submodel"
+                    sub_dir = models_dir / f"{sub_type}_submodel"
                     sub_dir.mkdir(parents=True, exist_ok=True)
                     logger.info(f"[Ensemble-Individual] Training submodel: {sub_type} (dir: {sub_dir})")
                     model, trainer = train_and_save_individual_model(sub_type, sub_cfg, datasets, device, sub_dir, vocab=vocab, debug_predictions=args.debug_predictions)
@@ -596,10 +599,9 @@ def main():
                 # Save ensemble config and submodel references
                 ensemble_config = dict(config.model)
                 ensemble_config['submodel_dirs'] = [str(d) for d in submodel_dirs]
-                with open(output_dir / "ensemble_config.json", "w", encoding="utf-8") as f:
+                with open(models_dir / "ensemble_config.json", "w", encoding="utf-8") as f:
                     json.dump(ensemble_config, f, indent=2)
-                # Save top-level config again for clarity
-                config_manager.save_config(config, output_dir / "config.yaml")
+                config_manager.save_config(config, models_dir / "config.yaml")
                 logger.info(f"Ensemble (individual) training complete. All submodels saved.")
             else:
                 # Joint training: train ensemble as a single model
@@ -613,7 +615,6 @@ def main():
                 collate_fn = get_joint_ensemble_collate_fn(tokenizers, max_length=config.data.get('max_length', 128), vocab=vocab)
                 train_loader = DataLoader(datasets['train'], batch_size=config.data.batch_sizes.get('train', 16), shuffle=True, collate_fn=collate_fn)
                 val_loader = DataLoader(datasets['validation'], batch_size=config.data.batch_sizes.get('validation', 32), shuffle=False, collate_fn=collate_fn)
-                # Build ensemble model
                 submodels = []
                 for sub_cfg in config.model.models:
                     sub_type = sub_cfg['type'].replace('_', '-')
@@ -626,7 +627,7 @@ def main():
                 weights = [m.get('weight', 1.0/len(submodels)) for m in config.model.models]
                 ensemble_model = create_model(model_type='ensemble', model_config={'models': submodels, 'weights': weights})
                 from src.training import EmotionTrainer
-                trainer = EmotionTrainer(model=ensemble_model, device=device, save_dir=str(output_dir))
+                trainer = EmotionTrainer(model=ensemble_model, device=device, save_dir=str(models_dir))
                 training_history = trainer.train(
                     num_epochs=config.training.num_epochs,
                     batch_size=config.data.batch_sizes.get('train', 16),
@@ -637,34 +638,31 @@ def main():
                     val_loader=val_loader,
                     debug_predictions=args.debug_predictions
                 )
-                # Save ensemble model checkpoint
                 trainer.save_model("ensemble_best_model")
-                # Save tokenizers for submodels
                 for sub_cfg in config.model.models:
                     sub_type = sub_cfg['type'].replace('_', '-')
                     if sub_type == 'distilbert':
                         tokenizer = AutoTokenizer.from_pretrained('distilbert-base-uncased')
-                        tokenizer.save_pretrained(output_dir / 'distilbert_best_model_tokenizer')
+                        tokenizer.save_pretrained(models_dir / 'distilbert_best_model_tokenizer')
                     elif sub_type in ['twitter-roberta', 'twitter_roberta', 'roberta']:
                         tokenizer = AutoTokenizer.from_pretrained('cardiffnlp/twitter-roberta-base-emotion')
-                        tokenizer.save_pretrained(output_dir / 'twitter-roberta_best_model_tokenizer')
-                # Save BiLSTM vocab if present
+                        tokenizer.save_pretrained(models_dir / 'twitter-roberta_best_model_tokenizer')
                 if vocab is not None:
-                    vocab_path = output_dir / "bilstm_vocab.json"
+                    vocab_path = models_dir / "bilstm_vocab.json"
                     with open(vocab_path, "w", encoding="utf-8") as f:
                         json.dump(vocab, f)
-                # Save training history
-                with open(output_dir / "training_history.json", "w", encoding="utf-8") as f:
+                with open(outputs_dir / "training_history.json", "w", encoding="utf-8") as f:
                     json.dump(training_history, f, indent=2)
                 logger.info(f"Ensemble (joint) training complete. Model and assets saved.")
         else:
             # Single model training
             sub_type = config.model.type.replace('_', '-')
             logger.info(f"Training single model: {sub_type}")
-            model, trainer = train_and_save_individual_model(sub_type, dict(config.model), datasets, device, output_dir, vocab=vocab, debug_predictions=args.debug_predictions)
+            model, trainer = train_and_save_individual_model(sub_type, dict(config.model), datasets, device, models_dir, vocab=vocab, debug_predictions=args.debug_predictions)
         # --- Evaluation ---
         if not args.no_evaluation:
-            evaluate_model(config, trainer if 'trainer' in locals() else submodel_trainers[0], datasets, device, str(output_dir), debug_predictions=args.debug_predictions)
+            # Save evaluation reports in reports_dir
+            evaluate_model(config, trainer if 'trainer' in locals() else submodel_trainers[0], datasets, device, str(reports_dir), debug_predictions=args.debug_predictions)
     except Exception as e:
         logger.exception(f"Error during training: {e}")
         raise

@@ -209,29 +209,44 @@ class BiLSTMEmotionModel(nn.Module):
     
     def __init__(self, vocab_size: int, embedding_dim: int = 300, hidden_dim: int = 128,
                  num_layers: int = 2, num_labels: int = 6, dropout: float = 0.3,
-                 pretrained_embeddings: Optional[torch.Tensor] = None):
+                 pretrained_embeddings: Optional[torch.Tensor] = None,
+                 freeze_embeddings: bool = False,
+                 loss_type: str = 'cross_entropy',
+                 gamma: float = 2.0,
+                 label_smoothing: float = 0.0):
         super().__init__()
-        
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
         self.num_labels = num_labels
-        
+        self.loss_type = loss_type
+        self.gamma = gamma
+        self.label_smoothing = label_smoothing
         # Embedding layer
         self.embedding = nn.Embedding(vocab_size, embedding_dim)
         if pretrained_embeddings is not None:
             self.embedding.weight.data.copy_(pretrained_embeddings)
-            
+        self.embedding.weight.requires_grad = not freeze_embeddings
+        # Dropout after embedding
+        self.embedding_dropout = nn.Dropout(dropout)
         # BiLSTM layer
         self.lstm = nn.LSTM(embedding_dim, hidden_dim, num_layers, 
                            batch_first=True, bidirectional=True, dropout=dropout)
-        
         # Attention mechanism
         self.attention = nn.Linear(hidden_dim * 2, 1)
-        
+        # BatchNorm after attention
+        self.batchnorm = nn.BatchNorm1d(hidden_dim * 2)
         # Classification layers
         self.dropout = nn.Dropout(dropout)
         self.classifier = nn.Linear(hidden_dim * 2, num_labels)
-        
+        # Loss
+        if self.loss_type == 'focal':
+            from src.losses import FocalLoss
+            self.loss_fct = FocalLoss(gamma=self.gamma, label_smoothing=self.label_smoothing)
+        elif self.loss_type == 'cross_entropy':
+            self.loss_fct = nn.CrossEntropyLoss(label_smoothing=self.label_smoothing)
+        else:
+            raise ValueError(f"Unknown loss_type: {self.loss_type}")
+    
     def attention_mechanism(self, lstm_output, final_state):
         """Apply attention mechanism to LSTM outputs."""
         # lstm_output: (batch_size, seq_len, hidden_dim * 2)
@@ -246,30 +261,24 @@ class BiLSTMEmotionModel(nn.Module):
         return attended_output
         
     def forward(self, input_ids: torch.Tensor, labels: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
-        """Forward pass through the model."""
         # Embedding
         embedded = self.embedding(input_ids)  # (batch_size, seq_len, embedding_dim)
-        
+        embedded = self.embedding_dropout(embedded)
         # LSTM
         lstm_output, (hidden, cell) = self.lstm(embedded)  # (batch_size, seq_len, hidden_dim * 2)
-        
         # Concatenate final hidden states from both directions
         final_hidden = torch.cat((hidden[-2], hidden[-1]), dim=1)  # (batch_size, hidden_dim * 2)
-        
         # Apply attention
         attended_output = self.attention_mechanism(lstm_output, final_hidden)
-        
+        # BatchNorm
+        normed_output = self.batchnorm(attended_output)
         # Classification
-        output = self.dropout(attended_output)
+        output = self.dropout(normed_output)
         logits = self.classifier(output)
-        
         result = {'logits': logits}
-        
         if labels is not None:
-            loss_fct = nn.CrossEntropyLoss()
-            loss = loss_fct(logits, labels)
+            loss = self.loss_fct(logits, labels)
             result['loss'] = loss
-            
         return result
 
 class EnsembleEmotionModel(nn.Module):

@@ -103,7 +103,11 @@ def load_model_and_assets(model_path: str, config_path: str = None):
             tokenizer = AutoTokenizer.from_pretrained(str(tokenizer_dir)) if tokenizer_dir.exists() else AutoTokenizer.from_pretrained('cardiffnlp/twitter-roberta-base-emotion')
             tokenizers['twitter-roberta'] = tokenizer
         elif model_type == 'bilstm':
-            vocab_path = model_path.parent / 'bilstm_vocab.json'
+            # Always load vocab from model_path/bilstm_vocab.json
+            vocab_path = model_path / 'bilstm_vocab.json'
+            if not vocab_path.exists():
+                # Also try model_path.parent for legacy support
+                vocab_path = model_path.parent / 'bilstm_vocab.json'
             if vocab_path.exists():
                 with open(vocab_path, 'r', encoding='utf-8') as f:
                     vocab = json.load(f)
@@ -111,7 +115,7 @@ def load_model_and_assets(model_path: str, config_path: str = None):
                 model_config['vocab'] = vocab
                 model_config['vocab_size'] = len(vocab)
             else:
-                vocabs['bilstm'] = None
+                raise FileNotFoundError(f"BiLSTM vocab file not found at {vocab_path}. Cannot load model.")
         # Filter config for single model
         model_config_filtered = filter_model_config(model_class, model_config)
         model = create_model(model_type=model_type, model_config=model_config_filtered)

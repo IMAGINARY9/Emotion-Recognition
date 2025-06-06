@@ -36,7 +36,7 @@ class EmotionEvaluator:
                  tokenizer=None,
                  device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
                  emotion_names: List[str] = None,
-                 save_dir: str = 'reports'):
+                 save_dir: str = None):
         """
         Initialize the evaluator.
         
@@ -51,8 +51,26 @@ class EmotionEvaluator:
         self.tokenizer = tokenizer
         self.device = device
         self.emotion_names = emotion_names or ['sadness', 'joy', 'love', 'anger', 'fear', 'surprise']
+        model_name = getattr(model, 'name', model.__class__.__name__)
+        # Determine default save_dir based on model's directory if not provided
+        if save_dir is None:
+            # Try to get model directory from model attribute or state_dict path
+            model_dir = None
+            if hasattr(model, 'model_dir') and model.model_dir:
+                model_dir = Path(model.model_dir)
+            elif hasattr(model, 'save_dir') and model.save_dir:
+                model_dir = Path(model.save_dir)
+            elif hasattr(model, 'state_dict_path') and model.state_dict_path:
+                model_dir = Path(model.state_dict_path).parent
+            elif hasattr(model, 'name_or_path'):
+                model_dir = Path(model.name_or_path)
+            # Fallback: use model.name or class name
+            if model_dir and model_dir.exists():
+                save_dir = Path('reports') / model_dir.name
+            else:
+                save_dir = Path('reports') / model_name
         self.save_dir = Path(save_dir)
-        self.save_dir.mkdir(exist_ok=True)
+        self.save_dir.mkdir(parents=True, exist_ok=True)
         
         # Setup logging
         logging.basicConfig(level=logging.INFO)
@@ -154,24 +172,22 @@ class EmotionEvaluator:
         
         with torch.no_grad():
             for batch in dataloader:
-                # Move to device
-                if self.tokenizer:
-                    input_ids = batch['input_ids'].to(self.device)
+                input_ids = batch['input_ids'].to(self.device)
+                labels_batch = batch['label'].to(self.device)
+                # Only pass attention_mask if model expects it (transformers)
+                if self.tokenizer and ('distilbert' in self.model.__class__.__name__.lower() or 'roberta' in self.model.__class__.__name__.lower()):
                     attention_mask = batch['attention_mask'].to(self.device)
-                    labels_batch = batch['label'].to(self.device)
                     if hasattr(self.model, 'forward') and 'debug_predictions' in self.model.forward.__code__.co_varnames:
                         outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, debug_predictions=debug_predictions)
                     else:
                         outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
                 else:
-                    input_ids = batch['input_ids'].to(self.device)
-                    labels_batch = batch['label'].to(self.device)
                     if hasattr(self.model, 'forward') and 'debug_predictions' in self.model.forward.__code__.co_varnames:
-                        outputs = self.model(input_ids=input_ids, attention_mask=None, debug_predictions=debug_predictions)
+                        outputs = self.model(input_ids=input_ids, debug_predictions=debug_predictions)
                     else:
-                        outputs = self.model(input_ids=input_ids, attention_mask=None)
+                        outputs = self.model(input_ids=input_ids)
                 logits = outputs['logits']
-                probabilities = F.softmax(logits, dim=-1)
+                probabilities = torch.softmax(logits, dim=-1)
                 predictions = torch.argmax(logits, dim=-1)
                 all_predictions.extend(predictions.cpu().numpy())
                 all_probabilities.extend(probabilities.cpu().numpy())
@@ -355,13 +371,12 @@ class EmotionEvaluator:
             save_path: Path to save the plot
         """
         self.logger.info("Generating embedding visualization...")
-        
         # Sample data if needed
         if len(texts) > sample_size:
-            indices = np.random.choice(len(texts), sample_size, replace=False)
-            texts = [texts[i] for i in indices]
-            labels = [labels[i] for i in indices]
-        
+            import numpy as np
+            idx = np.random.choice(len(texts), sample_size, replace=False)
+            texts = [texts[i] for i in idx]
+            labels = [labels[i] for i in idx]
         # Extract embeddings
         embeddings = self._extract_embeddings(texts)
         if embeddings.size == 0:

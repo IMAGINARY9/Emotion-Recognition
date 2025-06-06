@@ -92,39 +92,29 @@ def save_output(results, args):
     """Save or print results."""
     if args.output_file:
         output_path = Path(args.output_file)
+        # --- Save predictions in reports/<model_dir_name>/ if not absolute path ---
+        if not output_path.is_absolute():
+            # Use model dir name for subfolder
+            model_path = Path(args.model_path)
+            if model_path.is_file():
+                model_dir_name = model_path.parent.name
+            else:
+                model_dir_name = model_path.name
+            output_path = Path("reports") / model_dir_name / output_path.name
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        
         if args.output_format == "json":
             with open(output_path, 'w', encoding='utf-8') as f:
                 json.dump(results, f, indent=2, ensure_ascii=False)
-        
         elif args.output_format == "csv":
+            import pandas as pd
             pd.DataFrame(results).to_csv(output_path, index=False)
-        
         elif args.output_format == "txt":
             with open(output_path, 'w', encoding='utf-8') as f:
-                for result in results:
-                    f.write(f"Text: {result['text']}\n")
-                    if 'emotion' in result:
-                        prob_str = f" (probability: {result['confidence']:.3f})" if 'confidence' in result else ""
-                        f.write(f"Predicted emotion: {result['emotion']}{prob_str}\n")
-                    f.write("\n")
-        
-        logger.info(f"Results saved to: {output_path}")
-    
+                for item in results:
+                    f.write(str(item) + "\n")
+        print(f"Predictions saved to: {output_path}")
     else:
-        # Print to console
-        print("\n" + "="*50)
-        print("EMOTION PREDICTIONS")
-        print("="*50)
-        
-        for result in results:
-            print(f"\nText: {result['text']}")
-            if 'emotion' in result:
-                prob_str = f" (probability: {result['confidence']:.3f})" if 'confidence' in result else ""
-                print(f"Predicted emotion: {result['emotion']}{prob_str}")
-        
-        print("="*50)
+        print(json.dumps(results, indent=2, ensure_ascii=False))
 
 def main():
     """Main prediction function."""
