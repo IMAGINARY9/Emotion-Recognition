@@ -28,7 +28,7 @@ sys.path.append(str(Path(__file__).parent.parent / "src"))
 from src.config import ConfigManager, setup_logging, get_device_config
 from src.data_utils import EmotionDataLoader, setup_data_directories, download_sample_data
 from src.preprocessing import EmotionPreprocessor, EmotionDataProcessor
-from src.models import create_model, EmotionDataset
+from src.models import create_model, EmotionDataset, BiLSTMEmotionModel
 from src.training import EmotionTrainer
 from src.evaluation import EmotionEvaluator
 from utils.model_loading import filter_model_config
@@ -566,12 +566,14 @@ def main():
     # --- Output directory structure ---
     models_dir = Path("models") / experiment_name
     reports_dir = Path("reports") / experiment_name
+    outputs_dir = models_dir / "outputs"
     logs_dir = Path("logs")
     for d in [models_dir, reports_dir, logs_dir]:
         d.mkdir(parents=True, exist_ok=True)
     logger.info(f"Experiment: {experiment_name}")
     logger.info(f"Model dir: {models_dir}")
     logger.info(f"Reports dir: {reports_dir}")
+    logger.info(f"Outputs dir: {outputs_dir}")
     logger.info(f"Logs dir: {logs_dir}")
     config_path = models_dir / "config.yaml"
     config_manager.save_config(config, config_path)

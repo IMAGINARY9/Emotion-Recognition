@@ -28,6 +28,8 @@ from datetime import datetime
 from models import EmotionDataset, create_model
 from preprocessing import EmotionPreprocessor
 from src.losses import FocalLoss
+from enhanced_datasets import EnhancedBiLSTMDataset, JointEnsembleDataset
+from vocab_utils import BiLSTMVocabularyBuilder
 
 class EmotionTrainer:
     """
@@ -129,7 +131,10 @@ class EmotionTrainer:
                            val_texts: List[str], 
                            val_labels: List[int],
                            batch_size: int = 32,
-                           max_length: int = 128) -> Tuple[DataLoader, DataLoader]:
+                           max_length: int = 128,
+                           use_enhanced_bilstm: bool = False,
+                           vocab_builder: Optional[BiLSTMVocabularyBuilder] = None,
+                           vocab_save_path: Optional[str] = None) -> Tuple[DataLoader, DataLoader]:
         """
         Create data loaders for training and validation.
         
@@ -140,13 +145,63 @@ class EmotionTrainer:
             val_labels: Validation labels
             batch_size: Batch size
             max_length: Maximum sequence length
+            use_enhanced_bilstm: Whether to use enhanced BiLSTM dataset
+            vocab_builder: Vocabulary builder for BiLSTM
+            vocab_save_path: Path to save vocabulary
             
         Returns:
             Tuple of training and validation data loaders
         """
-        # Create datasets
-        train_dataset = EmotionDataset(train_texts, train_labels, self.tokenizer, max_length)
-        val_dataset = EmotionDataset(val_texts, val_labels, self.tokenizer, max_length)
+        if use_enhanced_bilstm:
+            self.logger.info("Using Enhanced BiLSTM Dataset with vocabulary builder")
+            
+            # Initialize vocabulary builder if not provided
+            if vocab_builder is None:
+                vocab_builder = BiLSTMVocabularyBuilder(
+                    min_freq=2,
+                    max_vocab_size=15000,
+                    preserve_emotion_words=True
+                )
+            
+            # Create training dataset (builds vocabulary)
+            train_dataset = EnhancedBiLSTMDataset(
+                texts=train_texts,
+                labels=train_labels,
+                vocab=None,  # Will build vocabulary
+                max_length=max_length,
+                vocab_builder=vocab_builder
+            )
+            
+            # Get vocabulary from training dataset
+            vocab = train_dataset.get_vocab()
+            
+            # Save vocabulary if path provided
+            if vocab_save_path:
+                vocab_builder.save_vocabulary(vocab, vocab_save_path)
+                self.logger.info(f"Vocabulary saved to {vocab_save_path}")
+            
+            # Create validation dataset with same vocabulary
+            val_dataset = EnhancedBiLSTMDataset(
+                texts=val_texts,
+                labels=val_labels,
+                vocab=vocab,  # Use training vocabulary
+                max_length=max_length,
+                vocab_builder=vocab_builder
+            )
+            
+            # Analyze vocabulary
+            stats = vocab_builder.analyze_vocabulary(vocab, train_texts)
+            self.logger.info(f"Vocabulary statistics: {stats}")
+            
+            # Store vocabulary for later use
+            self.vocab = vocab
+            self.vocab_builder = vocab_builder
+            
+        else:
+            # Use traditional dataset
+            train_dataset = EmotionDataset(train_texts, train_labels, self.tokenizer, max_length)
+            val_dataset = EmotionDataset(val_texts, val_labels, self.tokenizer, max_length)
+        
         # Use custom collate_fn if available (for BiLSTM/traditional models)
         train_collate_fn = getattr(train_dataset, 'get_collate_fn', lambda: None)()
         val_collate_fn = getattr(val_dataset, 'get_collate_fn', lambda: None)()
@@ -205,34 +260,53 @@ class EmotionTrainer:
                     else:
                         outputs = self.model(input_ids=input_ids, labels=labels)
             
-            # Use class weights if available
-            if self.class_weights is not None and self.loss_type == 'cross_entropy':
-                loss_fct = nn.CrossEntropyLoss(weight=self.class_weights, label_smoothing=self.label_smoothing)
-                loss = loss_fct(outputs['logits'], labels)
-            elif self.class_weights is not None and self.loss_type == 'focal':
-                loss_fct = FocalLoss(gamma=self.gamma, weight=self.class_weights, label_smoothing=self.label_smoothing)
-                loss = loss_fct(outputs['logits'], labels)
-            elif hasattr(self.model, 'loss_fct'):
-                loss = self.model.loss_fct(outputs['logits'], labels)
-            else:
-                loss = outputs['loss']
+            loss = outputs.get('loss') # Use .get() to safely access 'loss'
             logits = outputs['logits']
-            
+
+            # If model's forward pass didn't compute loss (e.g., returned None), compute it here
+            if loss is None and labels is not None:
+                if self.loss_type == 'cross_entropy':
+                    loss_fct = nn.CrossEntropyLoss(weight=self.class_weights, label_smoothing=self.label_smoothing if hasattr(self, 'label_smoothing') else 0.0)
+                    loss = loss_fct(logits, labels)
+                elif self.loss_type == 'focal':
+                    # Ensure gamma and label_smoothing are available, provide defaults if not
+                    gamma = getattr(self, 'gamma', 2.0) 
+                    label_smoothing = getattr(self, 'label_smoothing', 0.0)
+                    loss_fct = FocalLoss(gamma=gamma, weight=self.class_weights, label_smoothing=label_smoothing)
+                    loss = loss_fct(logits, labels)
+                # Add other loss types here if necessary
+                elif hasattr(self.model, 'loss_fct'): # Fallback to model's own loss_fct if defined
+                    loss = self.model.loss_fct(logits, labels)
+                else:
+                    # This case should ideally not be reached if labels are present and a loss_type is specified
+                    # Or if the model is expected to always return a loss when labels are given.
+                    # Consider raising an error or logging a warning.
+                    self.logger.error("Loss is None and could not be computed in trainer. Ensure model's forward returns loss or trainer's loss_type is correctly configured.")
+                    # To prevent crash, but this indicates a setup problem:
+                    # loss = torch.tensor(0.0, device=self.device, requires_grad=True) # Placeholder, not ideal
+
             # Backward pass
-            optimizer.zero_grad()
-            loss.backward()
+            if loss is not None: # Ensure loss is not None before backward pass
+                optimizer.zero_grad()
+                loss.backward()
             
-            # Gradient clipping
-            if self.gradient_clipping > 0:
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.gradient_clipping)
+                # Gradient clipping
+                if self.gradient_clipping > 0:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.gradient_clipping)
             
-            optimizer.step()
+                optimizer.step()
             
-            if scheduler:
-                scheduler.step()
+                if scheduler:
+                    scheduler.step()
             
-            # Update metrics
-            total_loss += loss.item()
+                # Update metrics
+                total_loss += loss.item() if loss is not None else 0 # Handle if loss ended up None
+            else:
+                # If loss is still None here, it means it wasn't computed and backward pass was skipped.
+                # This might happen if labels were not provided, or if there's a config issue.                # Log this situation if it's unexpected during training with labels.
+                if labels is not None:
+                    self.logger.warning("Loss was None during training epoch, backward pass skipped. Check model output and loss configuration.")
+            
             predictions = torch.argmax(logits, dim=-1)
             all_predictions.extend(predictions.cpu().numpy())
             all_labels.extend(labels.cpu().numpy())
@@ -300,20 +374,36 @@ class EmotionTrainer:
                             outputs = self.model(input_ids=input_ids, labels=labels, debug_predictions=debug_predictions)
                         else:
                             outputs = self.model(input_ids=input_ids, labels=labels)
-                # Use class weights if available
-                if self.class_weights is not None and self.loss_type == 'cross_entropy':
-                    loss_fct = nn.CrossEntropyLoss(weight=self.class_weights, label_smoothing=self.label_smoothing)
-                    loss = loss_fct(outputs['logits'], labels)
-                elif self.class_weights is not None and self.loss_type == 'focal':
-                    loss_fct = FocalLoss(gamma=self.gamma, weight=self.class_weights, label_smoothing=self.label_smoothing)
-                    loss = loss_fct(outputs['logits'], labels)
-                elif hasattr(self.model, 'loss_fct'):
-                    loss = self.model.loss_fct(outputs['logits'], labels)
-                else:
-                    loss = outputs['loss']
-                logits = outputs['logits']
                 
-                total_loss += loss.item()
+                logits = outputs['logits']
+                loss = outputs.get('loss')
+
+                # If model's forward pass didn't compute loss (e.g., returned None), compute it here
+                if loss is None and labels is not None:
+                    if self.loss_type == 'cross_entropy':
+                        loss_fct = nn.CrossEntropyLoss(weight=self.class_weights, label_smoothing=self.label_smoothing if hasattr(self, 'label_smoothing') else 0.0)
+                        loss = loss_fct(logits, labels)
+                    elif self.loss_type == 'focal':
+                        gamma = getattr(self, 'gamma', 2.0)
+                        label_smoothing = getattr(self, 'label_smoothing', 0.0)
+                        loss_fct = FocalLoss(gamma=gamma, weight=self.class_weights, label_smoothing=label_smoothing)
+                        loss = loss_fct(logits, labels)
+                    elif hasattr(self.model, 'loss_fct'): # Fallback to model's own loss_fct if defined
+                        loss = self.model.loss_fct(logits, labels)
+                    else:
+                        self.logger.error("Validation loss is None and could not be computed. Check model output and loss configuration.")
+                        # To prevent crash, but this indicates a setup problem:
+                        # loss = torch.tensor(0.0, device=self.device) # Placeholder, not ideal
+                
+                if loss is not None:
+                    total_loss += loss.item()
+                else:
+                    # If loss is still None, it means it wasn't computed.
+                    # This might happen if labels were not provided (not typical for validation with labels)
+                    # or if there's a config issue and no fallback was hit.
+                    if labels is not None:
+                        self.logger.warning("Loss was None during validation epoch. Check model output and loss configuration.")
+
                 predictions = torch.argmax(logits, dim=-1)
                 all_predictions.extend(predictions.cpu().numpy())
                 all_labels.extend(labels.cpu().numpy())
@@ -395,17 +485,99 @@ class EmotionTrainer:
             optimizer, 
             num_warmup_steps=self.warmup_steps,
             num_training_steps=total_steps
-        )
+        )        
         best_val_f1 = 0
         patience_counter = 0
+        collapse_recovery_attempts = 0
+        max_recovery_attempts = 3
+        
         for epoch in range(num_epochs):
             start_time = time.time()
             self.logger.info(f"Epoch {epoch + 1}/{num_epochs}")
+            
             # Training
             train_loss, train_acc, train_f1, train_pred_dist = self.train_epoch(train_loader, optimizer, scheduler, debug_predictions=debug_predictions)
+            
             # Validation
             val_loss, val_acc, val_f1, detailed_metrics = self.validate(val_loader, debug_predictions=debug_predictions)
             val_pred_dist = detailed_metrics.get('prediction_distribution', {})
+            
+            # Detect model collapse on training and validation
+            train_all_labels = []
+            train_all_predictions = []
+            for batch in train_loader:
+                if self.tokenizer:
+                    input_ids = batch['input_ids'].to(self.device)
+                    attention_mask = batch.get('attention_mask', None)
+                    labels = batch['label'].to(self.device)
+                    with torch.no_grad():
+                        if attention_mask is not None:
+                            outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
+                        else:
+                            outputs = self.model(input_ids=input_ids)
+                        predictions = torch.argmax(outputs['logits'], dim=-1)
+                        train_all_predictions.extend(predictions.cpu().numpy())
+                        train_all_labels.extend(labels.cpu().numpy())
+                else:
+                    input_ids = batch['input_ids'].to(self.device)
+                    labels = batch['label'].to(self.device)
+                    with torch.no_grad():
+                        outputs = self.model(input_ids=input_ids)
+                        predictions = torch.argmax(outputs['logits'], dim=-1)
+                        train_all_predictions.extend(predictions.cpu().numpy())
+                        train_all_labels.extend(labels.cpu().numpy())
+            
+            # Check for collapse on training data
+            train_collapse_info = self.detect_model_collapse(train_all_predictions, train_all_labels)
+            
+            # Get validation predictions for collapse detection
+            val_all_labels = []
+            val_all_predictions = []
+            for batch in val_loader:
+                if self.tokenizer:
+                    input_ids = batch['input_ids'].to(self.device)
+                    attention_mask = batch.get('attention_mask', None)
+                    labels = batch['label'].to(self.device)
+                    with torch.no_grad():
+                        if attention_mask is not None:
+                            outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
+                        else:
+                            outputs = self.model(input_ids=input_ids)
+                        predictions = torch.argmax(outputs['logits'], dim=-1)
+                        val_all_predictions.extend(predictions.cpu().numpy())
+                        val_all_labels.extend(labels.cpu().numpy())
+                else:
+                    input_ids = batch['input_ids'].to(self.device)
+                    labels = batch['label'].to(self.device)
+                    with torch.no_grad():
+                        outputs = self.model(input_ids=input_ids)
+                        predictions = torch.argmax(outputs['logits'], dim=-1)
+                        val_all_predictions.extend(predictions.cpu().numpy())
+                        val_all_labels.extend(labels.cpu().numpy())
+            
+            val_collapse_info = self.detect_model_collapse(val_all_predictions, val_all_labels)
+            
+            # Log collapse detection results
+            if train_collapse_info['collapse_detected']:
+                self.logger.warning(f"Model collapse detected in training! Active classes: {train_collapse_info['active_classes']}/{train_collapse_info['total_classes']}")
+                self.logger.warning(f"Dominant class: {self.emotion_names[train_collapse_info['dominant_class']]} ({train_collapse_info['dominant_class_proportion']:.2%})")
+                
+            if val_collapse_info['collapse_detected']:
+                self.logger.warning(f"Model collapse detected in validation! Active classes: {val_collapse_info['active_classes']}/{val_collapse_info['total_classes']}")
+                
+                # Apply recovery if collapse is severe and we haven't reached max attempts
+                if (val_collapse_info['active_classes'] <= 2 and 
+                    collapse_recovery_attempts < max_recovery_attempts):
+                    
+                    recovery_type = ['lr_reset', 'lr_boost', 'weight_noise'][collapse_recovery_attempts % 3]
+                    self.apply_collapse_recovery(optimizer, recovery_type)
+                    collapse_recovery_attempts += 1
+                    
+                    # Reset patience counter for recovery attempt
+                    patience_counter = max(0, patience_counter - 2)
+                    
+                    self.logger.info(f"Collapse recovery attempt {collapse_recovery_attempts}/{max_recovery_attempts}")
+            
             # Update history
             self.history['train_loss'].append(train_loss)
             self.history['val_loss'].append(val_loss)
@@ -531,3 +703,93 @@ class EmotionTrainer:
             self.logger.info(f"Training history plot saved to {save_path}")
         
         plt.show()
+    
+    def detect_model_collapse(self, predictions: List[int], labels: List[int], 
+                             threshold: float = 0.05) -> Dict[str, any]:
+        """
+        Detect if the model is collapsing (predicting only one or few classes).
+        
+        Args:
+            predictions: Model predictions
+            labels: True labels
+            threshold: Minimum proportion for a class to be considered active
+            
+        Returns:
+            Dictionary with collapse detection results
+        """
+        unique_preds, pred_counts = np.unique(predictions, return_counts=True)
+        unique_labels, label_counts = np.unique(labels, return_counts=True)
+        
+        total_predictions = len(predictions)
+        pred_proportions = pred_counts / total_predictions
+        
+        # Check for collapse
+        active_classes = np.sum(pred_proportions >= threshold)
+        total_classes = len(self.emotion_names)
+        
+        collapse_detected = active_classes <= max(1, total_classes * 0.3)  # Less than 30% of classes active
+        
+        # Calculate per-class metrics
+        class_metrics = {}
+        for i, emotion in enumerate(self.emotion_names):
+            class_preds = np.sum(np.array(predictions) == i)
+            class_labels = np.sum(np.array(labels) == i)
+            
+            precision = 0.0
+            recall = 0.0
+            f1 = 0.0
+            
+            if class_preds > 0:
+                precision = np.sum((np.array(predictions) == i) & (np.array(labels) == i)) / class_preds
+            if class_labels > 0:
+                recall = np.sum((np.array(predictions) == i) & (np.array(labels) == i)) / class_labels
+            if precision + recall > 0:
+                f1 = 2 * (precision * recall) / (precision + recall)
+            
+            class_metrics[emotion] = {
+                'predictions': int(class_preds),
+                'true_labels': int(class_labels),
+                'precision': float(precision),
+                'recall': float(recall),
+                'f1': float(f1)
+            }
+        
+        return {
+            'collapse_detected': collapse_detected,
+            'active_classes': int(active_classes),
+            'total_classes': int(total_classes),
+            'dominant_class': int(unique_preds[np.argmax(pred_counts)]),
+            'dominant_class_proportion': float(np.max(pred_proportions)),
+            'class_metrics': class_metrics,
+            'prediction_distribution': dict(zip(unique_preds.astype(int), pred_counts.astype(int)))
+        }
+    
+    def apply_collapse_recovery(self, optimizer, recovery_type: str = 'lr_reset'):
+        """
+        Apply recovery strategies when model collapse is detected.
+        
+        Args:
+            optimizer: Current optimizer
+            recovery_type: Type of recovery strategy
+        """
+        self.logger.warning(f"Applying collapse recovery strategy: {recovery_type}")
+        
+        if recovery_type == 'lr_reset':
+            # Reset learning rate to initial value
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = self.learning_rate
+                
+        elif recovery_type == 'lr_boost':
+            # Temporarily increase learning rate
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = min(param_group['lr'] * 2.0, self.learning_rate * 5)
+                
+        elif recovery_type == 'weight_noise':
+            # Add small noise to model weights
+            with torch.no_grad():
+                for param in self.model.parameters():
+                    if param.requires_grad:
+                        noise = torch.randn_like(param) * 0.01
+                        param.add_(noise)
+        
+        self.logger.info(f"Recovery strategy '{recovery_type}' applied")

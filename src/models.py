@@ -9,16 +9,15 @@ Based on the Twitter emotion classification task with 6 emotions:
 - sadness, joy, love, anger, fear, surprise
 """
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import Dataset
 from transformers import AutoModel, AutoConfig, AutoTokenizer
-from typing import Dict, List, Optional, Tuple, Union
-import numpy as np
-from sklearn.metrics import accuracy_score, classification_report, f1_score
+from typing import Dict, List, Optional, Tuple, Union # Added Union
+import torch
+import torch.nn as nn
 from torch.nn.utils.rnn import pad_sequence
 import itertools
+import torch.nn.functional as F
+from sklearn.metrics import accuracy_score, classification_report, f1_score # Added classification_report
 
 class EmotionDataset(Dataset):
     """Dataset class for emotion recognition."""
@@ -30,13 +29,47 @@ class EmotionDataset(Dataset):
         self.max_length = max_length
         self.vocab = vocab or {}
         
+        # Build vocabulary if not provided and no tokenizer
+        if not self.tokenizer and not vocab:
+            self.build_vocab()
+        
     def __len__(self):
         return len(self.texts)
+    
+    @property
+    def vocab_size(self):
+        """Return vocabulary size."""
+        return len(self.vocab) if self.vocab else 0
+    
+    def build_vocab(self, min_freq: int = 2, max_vocab_size: int = 15000):
+        """Build vocabulary from texts with frequency filtering."""
+        from collections import Counter
+        
+        # Count token frequencies
+        token_counts = Counter()
+        for text in self.texts:
+            tokens = text.lower().split()
+            token_counts.update(tokens)
+        
+        # Start with special tokens
+        vocab = {'<PAD>': 0, '<UNK>': 1}
+        vocab_idx = 2
+        
+        # Add tokens that meet minimum frequency
+        for token, count in token_counts.most_common():
+            if count >= min_freq and len(vocab) < max_vocab_size:
+                vocab[token] = vocab_idx
+                vocab_idx += 1
+            elif len(vocab) >= max_vocab_size:
+                break
+        
+        self.vocab = vocab
+        print(f"Built vocabulary with {len(vocab)} tokens (min_freq={min_freq})")
     
     def text_to_ids(self, text: str) -> List[int]:
         """Convert text to list of token IDs for traditional models."""
         tokens = text.lower().split()
-        return [self.vocab.get(token, 0) for token in tokens[:self.max_length]]
+        return [self.vocab.get(token, 1) for token in tokens[:self.max_length]]  # Use 1 for <UNK>
     
     def __getitem__(self, idx):
         text = str(self.texts[idx])
@@ -201,85 +234,272 @@ class TwitterRoBERTaEmotionModel(nn.Module):
 
 class BiLSTMEmotionModel(nn.Module):
     """
-    BiLSTM with attention mechanism for emotion recognition.
-    
-    This model uses word embeddings (GloVe) and bidirectional LSTM
-    with attention for emotion classification.
+    Enhanced BiLSTM with multiple attention mechanisms and improved architecture
+    for emotion recognition.
     """
-    
-    def __init__(self, vocab_size: int, embedding_dim: int = 300, hidden_dim: int = 128,
-                 num_layers: int = 2, num_labels: int = 6, dropout: float = 0.3,
+    def __init__(self, vocab_size: int, embedding_dim: int = 300, hidden_dim: int = 256,
+                 num_layers: int = 3, num_labels: int = 6, dropout: float = 0.3,
                  pretrained_embeddings: Optional[torch.Tensor] = None,
                  freeze_embeddings: bool = False,
-                 loss_type: str = 'cross_entropy',
+                 bidirectional: bool = True, 
+                 use_attention: bool = False, 
+                 padding_idx: int = 0, 
+                 loss_type: str = 'focal',
                  gamma: float = 2.0,
-                 label_smoothing: float = 0.0):
+                 label_smoothing: float = 0.1,
+                 vocab: Optional[dict] = None):
+        if vocab_size is None or embedding_dim is None:
+            raise ValueError("vocab_size and embedding_dim must not be None. Check your config and vocab loading.")
+        if not isinstance(vocab_size, int) or not isinstance(embedding_dim, int):
+            raise ValueError(f"vocab_size and embedding_dim must be integers, got {type(vocab_size)}, {type(embedding_dim)}")
+        self.padding_idx = padding_idx
         super().__init__()
-        self.hidden_dim = hidden_dim
-        self.num_layers = num_layers
-        self.num_labels = num_labels
-        self.loss_type = loss_type
-        self.gamma = gamma
-        self.label_smoothing = label_smoothing
-        # Embedding layer
-        self.embedding = nn.Embedding(vocab_size, embedding_dim)
+        self.vocab = vocab 
+        self.use_attention = use_attention
+        self.bidirectional = bidirectional
+        self.dropout = nn.Dropout(dropout)
+        self.embedding = nn.Embedding(vocab_size, embedding_dim, padding_idx=self.padding_idx)
         if pretrained_embeddings is not None:
             self.embedding.weight.data.copy_(pretrained_embeddings)
-        self.embedding.weight.requires_grad = not freeze_embeddings
-        # Dropout after embedding
-        self.embedding_dropout = nn.Dropout(dropout)
-        # BiLSTM layer
-        self.lstm = nn.LSTM(embedding_dim, hidden_dim, num_layers, 
-                           batch_first=True, bidirectional=True, dropout=dropout)
-        # Attention mechanism
-        self.attention = nn.Linear(hidden_dim * 2, 1)
-        # BatchNorm after attention
-        self.batchnorm = nn.BatchNorm1d(hidden_dim * 2)
-        # Classification layers
-        self.dropout = nn.Dropout(dropout)
-        self.classifier = nn.Linear(hidden_dim * 2, num_labels)
-        # Loss
-        if self.loss_type == 'focal':
-            from src.losses import FocalLoss
-            self.loss_fct = FocalLoss(gamma=self.gamma, label_smoothing=self.label_smoothing)
-        elif self.loss_type == 'cross_entropy':
-            self.loss_fct = nn.CrossEntropyLoss(label_smoothing=self.label_smoothing)
-        else:
-            raise ValueError(f"Unknown loss_type: {self.loss_type}")
-    
-    def attention_mechanism(self, lstm_output, final_state):
-        """Apply attention mechanism to LSTM outputs."""
-        # lstm_output: (batch_size, seq_len, hidden_dim * 2)
-        # final_state: (batch_size, hidden_dim * 2)
-        
-        # Calculate attention weights
-        attention_weights = torch.tanh(self.attention(lstm_output))  # (batch_size, seq_len, 1)
-        attention_weights = F.softmax(attention_weights.squeeze(2), dim=1)  # (batch_size, seq_len)
-        
-        # Apply attention weights
-        attended_output = torch.sum(lstm_output * attention_weights.unsqueeze(2), dim=1)
-        return attended_output
-        
+            if freeze_embeddings:
+                self.embedding.weight.requires_grad = False
+        self.lstm = nn.LSTM(embedding_dim, hidden_dim, num_layers=num_layers,
+                            bidirectional=bidirectional, batch_first=True,
+                            dropout=dropout if num_layers > 1 else 0)
+        lstm_output_dim = hidden_dim * 2 if bidirectional else hidden_dim
+        self.lstm_output_dim = lstm_output_dim  # Save for reference if needed
+        self.num_labels = num_labels
+        self.dropout_rate = dropout
+        if self.use_attention:
+            self.attention = SelfAttention(lstm_output_dim, dropout=dropout)
+        self.fc = EnhancedClassifier(lstm_output_dim, num_labels, dropout=dropout)
+        self._init_weights()
+
+    def _init_weights(self):
+        for name, param in self.named_parameters():
+            if 'embedding.weight' in name and self.embedding.weight.requires_grad:
+                nn.init.xavier_uniform_(param)
+            elif 'lstm.weight_ih' in name:
+                nn.init.xavier_uniform_(param)
+            elif 'lstm.weight_hh' in name:
+                nn.init.orthogonal_(param)
+            elif 'lstm.bias' in name:
+                nn.init.constant_(param, 0.0)
+                # Initialize forget gate bias to 1 for LSTM
+                # LSTM bias is init as (b_ii|b_if|b_ig|b_io)
+                # Hidden_dim is the size of each of these parts
+                if hasattr(param, 'data'): # Check if param is a tensor
+                    n = param.size(0)
+                    start, end = n // 4, n // 2
+                    param.data[start:end].fill_(1.)
+
+        # EnhancedClassifier might have its own _init_weights
+        if hasattr(self.fc, '_init_weights') and callable(getattr(self.fc, '_init_weights')):
+            self.fc._init_weights()
+        elif isinstance(self.fc, nn.Linear):
+            nn.init.xavier_uniform_(self.fc.weight)
+            if self.fc.bias is not None:
+                nn.init.constant_(self.fc.bias, 0.0)
+
     def forward(self, input_ids: torch.Tensor, labels: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
-        # Embedding
-        embedded = self.embedding(input_ids)  # (batch_size, seq_len, embedding_dim)
-        embedded = self.embedding_dropout(embedded)
-        # LSTM
-        lstm_output, (hidden, cell) = self.lstm(embedded)  # (batch_size, seq_len, hidden_dim * 2)
-        # Concatenate final hidden states from both directions
-        final_hidden = torch.cat((hidden[-2], hidden[-1]), dim=1)  # (batch_size, hidden_dim * 2)
-        # Apply attention
-        attended_output = self.attention_mechanism(lstm_output, final_hidden)
-        # BatchNorm
-        normed_output = self.batchnorm(attended_output)
-        # Classification
-        output = self.dropout(normed_output)
-        logits = self.classifier(output)
-        result = {'logits': logits}
-        if labels is not None:
-            loss = self.loss_fct(logits, labels)
-            result['loss'] = loss
-        return result
+        # input_ids: (batch_size, seq_len)
+        # Create mask for padding tokens before embedding, if needed by attention or other parts
+        # Mask is True for non-padded tokens, False for padded ones.
+        attention_mask = (input_ids != self.padding_idx).float() # (batch_size, seq_len)
+
+        embedded = self.dropout(self.embedding(input_ids))
+        # embedded: (batch_size, seq_len, embedding_dim)
+
+        lstm_out, (hidden, cell) = self.lstm(embedded)
+        # lstm_out: (batch_size, seq_len, hidden_dim * num_directions)
+        # hidden: (num_layers * num_directions, batch_size, hidden_dim)
+
+        if self.use_attention:
+            # SelfAttention expects (batch_size, seq_len, features) and mask (batch_size, seq_len)
+            # Assuming SelfAttention returns (batch_size, features_after_attention)
+            processed_output = self.attention(lstm_out, attention_mask) 
+        else:
+            # If not using attention, use the final hidden state(s)
+            if self.bidirectional:
+                # Concatenate the final forward and backward hidden states from the last layer
+                # hidden is (num_layers * 2, batch, hidden_dim)
+                # Forward final: hidden[-2, :, :], Backward final: hidden[-1, :, :]
+                processed_output = torch.cat((hidden[-2,:,:], hidden[-1,:,:]), dim=1)
+            else:
+                # hidden is (num_layers * 1, batch, hidden_dim)
+                processed_output = hidden[-1,:,:]
+            processed_output = self.dropout(processed_output)
+            # processed_output: (batch_size, hidden_dim * num_directions) or (batch_size, hidden_dim)
+
+        logits = self.fc(processed_output)
+        # logits: (batch_size, num_labels)
+
+        loss = None
+        # Loss calculation is typically handled by the trainer
+        # If labels are provided and loss needs to be computed here (e.g. for FocalLoss which might be part of the model):
+        # if labels is not None:
+        #     if self.loss_type == 'focal': # Example, actual loss comp might be more complex
+        #         loss_fct = FocalLoss(gamma=self.gamma, label_smoothing=self.label_smoothing) # Assuming FocalLoss is defined
+        #         loss = loss_fct(logits, labels)
+        #     else:
+        #         loss_fct = nn.CrossEntropyLoss(label_smoothing=self.label_smoothing)
+        #         loss = loss_fct(logits, labels)
+
+        return {"logits": logits, "loss": loss} 
+
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000):
+        super().__init__()
+        self.dropout = nn.Dropout(p=dropout)
+        import math
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0).transpose(0, 1)
+        self.register_buffer('pe', pe)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.pe[:x.size(1), :].transpose(0, 1)
+        return self.dropout(x)
+
+class SelfAttention(nn.Module):
+    """Improved self-attention mechanism for BiLSTM."""
+    
+    def __init__(self, hidden_dim: int, dropout: float = 0.1, num_heads: int = 1):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.num_heads = num_heads
+        self.head_dim = hidden_dim // num_heads
+        
+        assert hidden_dim % num_heads == 0, "hidden_dim must be divisible by num_heads"
+        
+        self.query = nn.Linear(hidden_dim, hidden_dim)
+        self.key = nn.Linear(hidden_dim, hidden_dim)
+        self.value = nn.Linear(hidden_dim, hidden_dim)
+        self.dropout = nn.Dropout(dropout)
+        
+        # Output projection
+        self.out_proj = nn.Linear(hidden_dim, hidden_dim)
+        
+        # Layer normalization for residual connection
+        self.layer_norm = nn.LayerNorm(hidden_dim)
+        
+    def forward(self, lstm_output: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # lstm_output: (batch_size, seq_len, hidden_dim)
+        # mask: (batch_size, seq_len), 1 for valid tokens, 0 for padding
+        
+        batch_size, seq_len, hidden_dim = lstm_output.shape
+        
+        # Compute Q, K, V
+        Q = self.query(lstm_output)  # (batch_size, seq_len, hidden_dim)
+        K = self.key(lstm_output)
+        V = self.value(lstm_output)
+        
+        # Reshape for multi-head attention
+        if self.num_heads > 1:
+            Q = Q.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+            K = K.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+            V = V.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+            # Now: (batch_size, num_heads, seq_len, head_dim)
+        else:
+            # Single head case
+            Q = Q.unsqueeze(1)  # (batch_size, 1, seq_len, hidden_dim)
+            K = K.unsqueeze(1)
+            V = V.unsqueeze(1)
+        
+        # Compute attention scores
+        scale = torch.sqrt(torch.tensor(self.head_dim, dtype=torch.float32, device=Q.device))
+        attention_scores = torch.matmul(Q, K.transpose(-2, -1)) / scale
+        # attention_scores: (batch_size, num_heads, seq_len, seq_len)
+        
+        # Apply mask if provided
+        if mask is not None:
+            # Expand mask for multi-head attention
+            # mask: (batch_size, seq_len) -> (batch_size, 1, 1, seq_len)
+            mask = mask.unsqueeze(1).unsqueeze(1)
+            attention_scores = attention_scores.masked_fill(mask == 0, -1e9)
+        
+        # Apply softmax
+        attention_weights = torch.softmax(attention_scores, dim=-1)
+        attention_weights = self.dropout(attention_weights)
+        
+        # Apply attention to values
+        context = torch.matmul(attention_weights, V)
+        # context: (batch_size, num_heads, seq_len, head_dim)
+        
+        # Concatenate heads
+        if self.num_heads > 1:
+            context = context.transpose(1, 2).contiguous().view(batch_size, seq_len, hidden_dim)
+        else:
+            context = context.squeeze(1)
+        
+        # Output projection
+        output = self.out_proj(context)
+        
+        # Residual connection and layer norm
+        output = self.layer_norm(output + lstm_output)
+        
+        # Global pooling with mask awareness
+        if mask is not None:
+            # Mask out padding tokens
+            mask_expanded = mask.unsqueeze(-1).float()
+            masked_output = output * mask_expanded
+            
+            # Compute weighted average
+            sum_output = torch.sum(masked_output, dim=1)
+            count_non_pad = torch.sum(mask_expanded, dim=1).clamp(min=1e-8)
+            pooled_output = sum_output / count_non_pad
+        else:
+            # Simple mean pooling
+            pooled_output = torch.mean(output, dim=1)
+        
+        return pooled_output
+
+class EnhancedClassifier(nn.Module):
+    def __init__(self, input_dim: int, num_labels: int, dropout: float = 0.3):
+        super().__init__()
+        self.main_classifier = nn.Sequential(
+            nn.Linear(input_dim, input_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.LayerNorm(input_dim // 2),
+            nn.Linear(input_dim // 2, input_dim // 4),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(input_dim // 4, num_labels)
+        )
+        self.aux_classifier = nn.Sequential(
+            nn.Linear(input_dim, input_dim // 3),
+            nn.Tanh(),
+            nn.Dropout(dropout),
+            nn.Linear(input_dim // 3, num_labels)
+        )
+        self.confidence_estimator = nn.Sequential(
+            nn.Linear(input_dim, input_dim // 4),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(input_dim // 4, 1),
+            nn.Sigmoid()
+        )
+    def _init_weights(self):
+        for layer in self.main_classifier:
+            if isinstance(layer, nn.Linear):
+                nn.init.xavier_uniform_(layer.weight)
+                nn.init.constant_(layer.bias, 0.01)
+        for layer in self.aux_classifier:
+            if isinstance(layer, nn.Linear):
+                nn.init.xavier_uniform_(layer.weight)
+                nn.init.constant_(layer.bias, 0.01)
+        for layer in self.confidence_estimator:
+            if isinstance(layer, nn.Linear):
+                nn.init.xavier_uniform_(layer.weight)
+                nn.init.constant_(layer.bias, 0)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        main_logits = self.main_classifier(x)
+        aux_logits = self.aux_classifier(x)
+        logits = (main_logits + aux_logits) / 2
+        return logits
 
 class EnsembleEmotionModel(nn.Module):
     """
@@ -428,16 +648,21 @@ class EmotionPredictor:
                 'distilbert': None,
                 'twitter-roberta': None
             }
-            if hasattr(self.tokenizer, 'name_or_path'):
-                if 'distilbert' in self.tokenizer.name_or_path.lower():
-                    tokenizers['distilbert'] = self.tokenizer
-                elif 'roberta' in self.tokenizer.name_or_path.lower():
-                    tokenizers['twitter-roberta'] = self.tokenizer
+            # If only one tokenizer is available, use it for both keys
+            if self.tokenizer:
+                if hasattr(self.tokenizer, 'name_or_path'):
+                    if 'distilbert' in self.tokenizer.name_or_path.lower():
+                        tokenizers['distilbert'] = self.tokenizer
+                        tokenizers['twitter-roberta'] = self.tokenizer  # fallback
+                    elif 'roberta' in self.tokenizer.name_or_path.lower():
+                        tokenizers['twitter-roberta'] = self.tokenizer
+                        tokenizers['distilbert'] = self.tokenizer  # fallback
+                    else:
+                        tokenizers['distilbert'] = self.tokenizer
+                        tokenizers['twitter-roberta'] = self.tokenizer
                 else:
-                    # Fallback: assign to both
                     tokenizers['distilbert'] = self.tokenizer
                     tokenizers['twitter-roberta'] = self.tokenizer
-            # Try to get vocab for BiLSTM if present
             vocab = getattr(self.model, 'vocab', None)
             try:
                 from src.models import get_joint_ensemble_collate_fn
@@ -446,10 +671,16 @@ class EmotionPredictor:
             collate_fn = get_joint_ensemble_collate_fn(tokenizers, max_length=128, vocab=vocab)
             batch = [{'text': t, 'label': 0} for t in texts]  # dummy label
             batch_dict = collate_fn(batch)
-            # Remove 'labels' key for prediction
-            batch_dict = {k: v for k, v in batch_dict.items() if k != 'labels'}
             # Remove submodel keys where value is None
-            batch_dict = {k: (None if v is None else {kk: vv.to(self.device) for kk, vv in v.items()}) for k, v in batch_dict.items() if v is not None}
+            batch_dict = {
+                k: (
+                    None if v is None else
+                    {kk: vv.to(self.device) for kk, vv in v.items()} if isinstance(v, dict)
+                    else v.to(self.device)
+                )
+                for k, v in batch_dict.items() if v is not None
+            }
+            # Do NOT remove 'labels' key; submodels expect it
             with torch.no_grad():
                 if 'debug_predictions' in self.model.forward.__code__.co_varnames:
                     output = self.model(**batch_dict, debug_predictions=debug_predictions)
@@ -477,7 +708,23 @@ class EmotionPredictor:
         # --- Single model prediction ---
         with torch.no_grad():
             for text in texts:
-                output = self.model(text=[text], debug_predictions=debug_predictions) if 'debug_predictions' in self.model.forward.__code__.co_varnames else self.model(text=[text])
+                # --- BiLSTM path ---
+                if 'bilstm' in self.model.__class__.__name__.lower():
+                    # Tokenize to input_ids using vocab
+                    if hasattr(self, 'tokenizer') and self.tokenizer is not None and hasattr(self.tokenizer, 'encode'):
+                        # If a tokenizer is provided and has encode, use it (rare for BiLSTM)
+                        input_ids = torch.tensor([self.tokenizer.encode(text)], dtype=torch.long, device=self.device)
+                    else:
+                        # Use vocab to convert text to input_ids
+                        vocab = getattr(self.model, 'vocab', None)
+                        if vocab is None:
+                            raise ValueError("BiLSTM model requires a vocab for tokenization.")
+                        tokens = text.split()
+                        input_ids = torch.tensor([[vocab.get(token, vocab.get('<unk>', 0)) for token in tokens]], dtype=torch.long, device=self.device)
+                    output = self.model(input_ids=input_ids)
+                else:
+                    # Transformer path (DistilBERT, RoBERTa, etc.)
+                    output = self.model(text=[text], debug_predictions=debug_predictions) if 'debug_predictions' in self.model.forward.__code__.co_varnames else self.model(text=[text])
                 logits = output['logits']
                 probabilities = F.softmax(logits, dim=-1)
                 predicted_class = torch.argmax(logits, dim=-1).item()
@@ -497,7 +744,7 @@ class EmotionPredictor:
                 results.append(result)
         return results[0] if is_single else results
 
-def create_model(model_type: str, model_config: Dict) -> nn.Module:
+def create_model(model_type, model_config=None, vocab=None, **kwargs):
     """
     Factory function to create emotion recognition models.
     
@@ -508,13 +755,71 @@ def create_model(model_type: str, model_config: Dict) -> nn.Module:
     Returns:
         Initialized model
     """
-    if model_type == 'distilbert':
+    if model_type.lower() == "bilstm":
+        vocab_size = None
+        embedding_dim = None
+        hidden_dim = None
+        num_layers = 1
+        num_labels = 6
+        dropout = 0.3
+        bidirectional = True
+        use_attention = False
+        pretrained_embeddings = None
+        freeze_embeddings = False
+        padding_idx = 0
+        loss_type = 'focal'
+        gamma = 2.0
+        label_smoothing = 0.1
+        # Extract from config if present
+        if model_config is not None:
+            # Try to get from model_config, fallback to main config if needed
+            vocab_size = getattr(model_config, 'vocab_size', None) or (model_config.get('vocab_size', None) if isinstance(model_config, dict) else None)
+            embedding_dim = getattr(model_config, 'embedding_dim', None) or (model_config.get('embedding_dim', None) if isinstance(model_config, dict) else None)
+            if embedding_dim is None and 'embedding_dim' in kwargs:
+                embedding_dim = kwargs['embedding_dim']
+            hidden_dim = getattr(model_config, 'hidden_dim', None) or (model_config.get('hidden_dim', None) if isinstance(model_config, dict) else None)
+            num_layers = getattr(model_config, 'num_layers', num_layers) or (model_config.get('num_layers', num_layers) if isinstance(model_config, dict) else num_layers)
+            num_labels = getattr(model_config, 'num_labels', None) or model_config.get('num_labels', None)
+            if num_labels is None:
+                num_labels = getattr(model_config, 'num_classes', None) or model_config.get('num_classes', 6)
+            dropout = getattr(model_config, 'dropout', None) or model_config.get('dropout', None) or getattr(model_config, 'dropout_rate', None) or model_config.get('dropout_rate', 0.3)
+            bidirectional = getattr(model_config, 'bidirectional', bidirectional) or model_config.get('bidirectional', bidirectional)
+            use_attention = getattr(model_config, 'attention', use_attention) or model_config.get('attention', use_attention)
+            pretrained_embeddings = getattr(model_config, 'pretrained_embeddings', None) or model_config.get('pretrained_embeddings', None)
+            freeze_embeddings = getattr(model_config, 'freeze', freeze_embeddings) or model_config.get('freeze', freeze_embeddings)
+            padding_idx = getattr(model_config, 'padding_idx', padding_idx) or model_config.get('padding_idx', padding_idx)
+            loss_type = getattr(model_config, 'loss_type', loss_type) or model_config.get('loss_type', loss_type)
+            gamma = getattr(model_config, 'gamma', gamma) or model_config.get('gamma', gamma)
+            label_smoothing = getattr(model_config, 'label_smoothing', label_smoothing) or model_config.get('label_smoothing', label_smoothing)
+        if vocab_size is None and vocab is not None:
+            vocab_size = len(vocab)
+        if embedding_dim is None:
+            embedding_dim = 300  # fallback default for BiLSTM
+        if vocab_size is None:
+            raise ValueError("vocab_size must be specified in the config or inferred from vocab for BiLSTM model.")
+        return BiLSTMEmotionModel(
+            vocab_size=vocab_size,
+            embedding_dim=embedding_dim,
+            hidden_dim=hidden_dim,
+            num_layers=num_layers,
+            num_labels=num_labels,
+            dropout=dropout,
+            bidirectional=bidirectional,
+            use_attention=use_attention,
+            pretrained_embeddings=pretrained_embeddings,
+            freeze_embeddings=freeze_embeddings,
+            padding_idx=padding_idx,
+            loss_type=loss_type,
+            gamma=gamma,
+            label_smoothing=label_smoothing,
+            vocab=vocab,
+            **kwargs
+        )
+    elif model_type == "distilbert":
         return DistilBERTEmotionModel(**model_config)
-    elif model_type == 'twitter-roberta':
+    elif model_type == "twitter-roberta":
         return TwitterRoBERTaEmotionModel(**model_config)
-    elif model_type == 'bilstm':
-        return BiLSTMEmotionModel(**model_config)
-    elif model_type == 'ensemble':
+    elif model_type == "ensemble":
         # For ensemble, model_config should contain 'models' and optionally 'weights'
         return EnsembleEmotionModel(**model_config)
     else:
@@ -608,16 +913,15 @@ def get_joint_ensemble_collate_fn(tokenizers, max_length=128, vocab=None):
         labels = torch.tensor([item['label'] for item in batch], dtype=torch.long)
         batch_dict = {'labels': labels}
         # DistilBERT
-        if 'distilbert' in tokenizers:
+        if tokenizers and 'distilbert' in tokenizers and tokenizers['distilbert'] is not None:
             enc = tokenizers['distilbert'](
                 texts, truncation=True, padding='max_length', max_length=max_length, return_tensors='pt'
             )
             batch_dict['distilbert'] = {'input_ids': enc['input_ids'], 'attention_mask': enc['attention_mask']}
         else:
-            # Always provide the key for ensemble robustness
             batch_dict['distilbert'] = None
         # Twitter-RoBERTa
-        if 'twitter-roberta' in tokenizers:
+        if tokenizers and 'twitter-roberta' in tokenizers and tokenizers['twitter-roberta'] is not None:
             enc = tokenizers['twitter-roberta'](
                 texts, truncation=True, padding='max_length', max_length=max_length, return_tensors='pt'
             )
@@ -635,6 +939,5 @@ def get_joint_ensemble_collate_fn(tokenizers, max_length=128, vocab=None):
             batch_dict['bilstm'] = {'input_ids': torch.tensor(input_ids, dtype=torch.long)}
         else:
             batch_dict['bilstm'] = None
-
         return batch_dict
     return collate_fn

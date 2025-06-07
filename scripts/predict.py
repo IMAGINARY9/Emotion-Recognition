@@ -27,6 +27,7 @@ from src.config import ConfigManager, setup_logging, get_device_config
 from src.preprocessing import EmotionPreprocessor
 from src.models import create_model, EmotionPredictor
 from utils.model_loading import load_model_and_assets, filter_model_config
+from src.visualization import plot_word_importances, plot_ensemble_votes
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +52,17 @@ def parse_args():
         action="store_true",
         help="Show ensemble debug predictions/logits during prediction"
     )
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        default=1,
+        help="Number of top predictions to return per input (adaptive: if model is uncertain, may return more even if top-k=1)"
+    )
+    parser.add_argument(
+        "--visualize",
+        action="store_true",
+        help="Visualize prediction explanations and ensemble voting (saved to visualizations/<model_dir_name>/)"
+    )
     return parser.parse_args()
 
 def load_input_texts(args):
@@ -69,24 +81,71 @@ def load_input_texts(args):
         raise ValueError("No input texts found")
 
 def make_predictions(model, config, texts, device, args, tokenizers=None, vocabs=None):
-    """Make predictions on input texts."""
+    """Make predictions on input texts with support for top-k/adaptive output and visualization."""
     preproc_kwargs = {}
     preproc_section = getattr(config, 'preprocessing', {})
     for k in ['handle_emojis', 'expand_contractions', 'remove_stopwords', 'lemmatize', 'normalize_case', 'handle_social_media', 'min_length', 'max_length']:
         if hasattr(preproc_section, k):
             preproc_kwargs[k] = getattr(preproc_section, k)
     preprocessor = EmotionPreprocessor(**preproc_kwargs)
-    # For ensemble, pass tokenizers/vocabs to predictor if needed
-    predictor = EmotionPredictor(
+    # --- Do NOT pass vocab to EmotionPredictor; vocab is attached to the model if needed ---
+    predictor_kwargs = dict(
         model=model,
         tokenizer=tokenizers.get('distilbert') or tokenizers.get('twitter-roberta') if tokenizers else None,
         preprocessor=preprocessor,
         label_names=getattr(config, 'emotions', None),
         device=device
     )
-    # Make predictions
+    predictor = EmotionPredictor(**predictor_kwargs)
     logger.info(f"Making predictions on {len(texts)} texts...")
-    return predictor.predict(texts, return_probabilities=args.include_probabilities, debug_predictions=args.debug_predictions)
+
+    # --- Adaptive top-k logic ---
+    results = []
+    for idx, text in enumerate(texts):
+        pred = predictor.predict([text], return_probabilities=True, debug_predictions=args.debug_predictions)
+        # pred is a list of dicts, one per input
+        pred = pred[0]
+        # Get sorted probabilities
+        if 'probabilities' in pred:
+            probs = pred['probabilities']
+            labels = list(probs.keys())
+            prob_values = list(probs.values())
+            sorted_indices = sorted(range(len(prob_values)), key=lambda i: prob_values[i], reverse=True)
+            topk = args.top_k
+            # Adaptive: if top-1 and top-2 are close, or ensemble disagrees, return both
+            if topk == 1:
+                if len(prob_values) > 1 and abs(prob_values[sorted_indices[0]] - prob_values[sorted_indices[1]]) < 0.10:
+                    topk = 2
+                # For ensemble: if available, check for disagreement (stub)
+                if 'ensemble_votes' in pred and len(set(pred['ensemble_votes'].values())) > 1:
+                    topk = max(topk, len(set(pred['ensemble_votes'].values())))
+            top_preds = [
+                {
+                    'label': labels[i],
+                    'probability': prob_values[i]
+                } for i in sorted_indices[:topk]
+            ]
+            pred['top_predictions'] = top_preds
+        results.append(pred)
+
+        # Visualization using external module
+        if args.visualize:
+            try:
+                from pathlib import Path
+                model_path = Path(args.model_path)
+                model_dir_name = model_path.parent.name if model_path.is_file() else model_path.name
+                vis_dir = Path('visualizations') / model_dir_name
+                vis_dir.mkdir(parents=True, exist_ok=True)
+                if 'word_importances' in pred:
+                    words = pred['word_importances']['words']
+                    importances = pred['word_importances']['importances']
+                    plot_word_importances(words, importances, text, vis_dir, idx=idx)
+                if 'ensemble_votes' in pred:
+                    votes = pred['ensemble_votes']
+                    plot_ensemble_votes(votes, text, vis_dir, idx=idx)
+            except Exception as ve:
+                logger.warning(f"Visualization failed: {ve}")
+    return results
 
 def save_output(results, args):
     """Save or print results."""

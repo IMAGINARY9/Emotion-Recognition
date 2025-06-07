@@ -69,10 +69,11 @@ def load_model_and_assets(model_path: str, config_path: str = None):
                     sub_cfg['vocab_size'] = len(vocab)
                     vocabs['bilstm'] = vocab
                 else:
-                    vocabs['bilstm'] = None
+                    print(f"[Ensemble Warning] BiLSTM vocab file not found: {vocab_path}. Skipping BiLSTM submodel.")
+                    continue  # Skip this submodel if vocab is missing
             # Filter config for submodel
             sub_cfg_filtered = filter_model_config(model_class, sub_cfg)
-            submodel = create_model(model_type=sub_type, model_config=sub_cfg_filtered)
+            submodel = create_model(model_type=sub_type, model_config=sub_cfg_filtered, vocab=sub_cfg.get('vocab', None))
             if sub_type == 'distilbert':
                 checkpoint_path = model_path / 'distilbert_best_model.pt'
             elif sub_type == 'twitter-roberta':
@@ -118,7 +119,8 @@ def load_model_and_assets(model_path: str, config_path: str = None):
                 raise FileNotFoundError(f"BiLSTM vocab file not found at {vocab_path}. Cannot load model.")
         # Filter config for single model
         model_config_filtered = filter_model_config(model_class, model_config)
-        model = create_model(model_type=model_type, model_config=model_config_filtered)
+        # When creating the model, pass vocab if available
+        model = create_model(model_type=model_type, model_config=model_config_filtered, vocab=vocab)
         checkpoint_path = None
         if model_path.is_file() and model_path.suffix in ['.pt', '.pth']:
             checkpoint_path = model_path
@@ -130,7 +132,12 @@ def load_model_and_assets(model_path: str, config_path: str = None):
             raise FileNotFoundError(f"Model checkpoint not found in {model_path}")
         checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
         if 'model_state_dict' in checkpoint:
-            model.load_state_dict(checkpoint['model_state_dict'])
+            # When loading model state dict, allow missing/unexpected keys
+            try:
+                model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+            except RuntimeError as e:
+                import logging
+                logging.warning(f"Model loaded with missing/unexpected keys: {e}")
         else:
             model.load_state_dict(checkpoint)
         return model, config, tokenizers, vocabs

@@ -2,47 +2,45 @@
 
 model:
   type: "bilstm"
-  vocab_size: 12678
+  vocab_size: 15000
   embedding_dim: 300
-  hidden_dim: 512  # Increased hidden size for more capacity
-  num_layers: 3    # More layers for deeper learning
+  hidden_dim: 384  # Increased hidden size for more capacity
+  num_layers: 2   # Reduce LSTM layers for easier optimization
   num_classes: 6
-  dropout_rate: 0.2  # Lower dropout for BiLSTM
-  max_length: 256   # Allow longer sequences
+  dropout_rate: 0.2  # Slightly higher dropout
+  max_length: 128
   bidirectional: true
-  attention: true
+  attention: true  # Re-enable attention
   
   # Pre-trained embeddings
   pretrained_embeddings:
     use: true
     path: null  # Will use GloVe 300d if available
     freeze: false
-    
-  # Loss function
-  loss_type: focal  # Options: 'cross_entropy', 'focal'
-  gamma: 2.0        # Focal loss focusing parameter
-  label_smoothing: 0.0  # Label smoothing for loss
+  loss_type: cross_entropy  # Use standard cross-entropy loss
+  gamma: 2.0
+  label_smoothing: 0.0  # Turn off label smoothing
   freeze: false     # Ensure embeddings are trainable
     
 training:
-  batch_size: 64
-  learning_rate: 0.001  # Higher learning rate for BiLSTM
+  batch_size: 128  # Larger batch size for more stable gradients
+  learning_rate: 0.002  # Slightly higher learning rate
   optimizer: adamw      # Use AdamW optimizer
-  num_epochs: 30
-  warmup_steps: 0
-  weight_decay: 0.0     # No weight decay for BiLSTM
-  gradient_clip_norm: 5.0
-  
-  # Learning rate scheduler
+  num_epochs: 30  # More epochs with lower learning rate
+  warmup_steps: 500  # More warmup steps
+  weight_decay: 0.01     # Add some weight decay
+  gradient_clip_norm: 1.0  # Lower gradient clipping for stability
+    # Learning rate scheduler
   scheduler:
-    type: "step"
-    step_size: 5
+    type: "one_cycle"  # Use one-cycle scheduler if supported
+    step_size: 10
     gamma: 0.5
+    min_lr: 1e-6
   
   # Early stopping
   early_stopping:
     enabled: true
-    patience: 7  # More patience for early stopping
+    patience: 15  # Allow more epochs before stopping
     min_delta: 0.001
     metric: "val_f1"
     mode: "max"
@@ -57,8 +55,8 @@ data:
   
   # Data loading
   batch_sizes:
-    train: 64
-    validation: 128
+    train: 32  # Match training batch size
+    validation: 64
     test: 128
   
   shuffle:
@@ -73,20 +71,20 @@ preprocessing:
   lowercase: true
   remove_urls: true
   remove_mentions: true
-  remove_hashtags: true
+  remove_hashtags: false
   remove_extra_whitespace: true
-  remove_stopwords: true
+  remove_stopwords: false
   expand_contractions: true
   
   # Emoji handling
-  emoji_handling: "remove"  # Remove emojis for traditional model
+  emoji_handling: "convert"  # Remove emojis for traditional model
   
   # Special tokens
   add_special_tokens: false
   
   # Vocabulary building
-  min_freq: 2
-  max_vocab_size: 10000
+  min_freq: 1
+  max_vocab_size: 15000
 
 evaluation:
   metrics:
@@ -127,3 +125,20 @@ emotions:
   - "anger"
   - "fear"
   - "surprise"
+
+advanced:
+  data_augmentation:
+    enabled: true
+    techniques:
+      - "synonym_replacement"
+      - "random_insertion"
+      - "random_swap"
+    augmentation_ratio: 0.2
+  class_weighting:
+    enabled: true
+    strategy: "balanced"
+  mixed_precision:
+    enabled: false
+  gradient_accumulation:
+    enabled: true
+    steps: 2

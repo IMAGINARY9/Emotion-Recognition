@@ -189,7 +189,7 @@ The `configs/` directory contains YAML configuration files for each supported mo
 
 - `distilbert_config.yaml`: Configuration for the DistilBERT-based model. Includes transformer-specific parameters, training settings, and preprocessing suited for general text.
 - `twitter_roberta_config.yaml`: Configuration for the Twitter RoBERTa model. Optimized for social media data, with lighter preprocessing and settings tailored for tweets.
-- `bilstm_config.yaml`: Configuration for the BiLSTM model. Includes options for embedding, vocabulary, and more aggressive text cleaning.
+- `bilstm_improved_config.yaml`: Enhanced configuration for the BiLSTM model (default). Includes advanced options for embedding, vocabulary, regularization, and improved training strategies.
 - `ensemble_config.yaml`: Configuration for combining multiple models (DistilBERT, Twitter RoBERTa, BiLSTM) into an ensemble. Specifies voting strategies and references individual model configs.
 
 **Key Sections in Each Config:**
@@ -339,6 +339,21 @@ python scripts/evaluate.py -m outputs/my_model --error-analysis --save-predictio
 ```bash
 python scripts/predict.py -m outputs/my_model --csv-file data.csv --include-probabilities --top-k 3
 ```
+
+### Prediction Visualization
+
+You can visualize which words most influenced the model's emotion predictions, and (for ensembles) how submodels voted for the final result:
+
+```bash
+python scripts/predict.py -m outputs/my_model -t "I love this amazing day!" --visualize
+```
+
+- Visualizations are saved to `visualizations/<model_dir_name>/`.
+- For each input, the following plots may be generated:
+  - **Word Importances**: Bar plot showing the importance of each word in the input for the predicted emotion(s).
+  - **Ensemble Voting**: Bar plot showing how each submodel voted for the final emotion label (for ensemble models).
+
+You can use `--visualize` with any prediction mode (single, batch, or CSV).
 
 ## Preprocessing Options
 
