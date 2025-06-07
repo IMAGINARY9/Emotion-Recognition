@@ -27,7 +27,7 @@ from src.config import ConfigManager, setup_logging, get_device_config
 from src.preprocessing import EmotionPreprocessor
 from src.models import create_model, EmotionPredictor
 from utils.model_loading import load_model_and_assets, filter_model_config
-from src.visualization import plot_word_importances, plot_ensemble_votes
+from src.visualization import plot_word_importances, plot_ensemble_votes, plot_confidence_progression
 
 logger = logging.getLogger(__name__)
 
@@ -125,7 +125,7 @@ def make_predictions(model, config, texts, device, args, tokenizers=None, vocabs
                     'probability': prob_values[i]
                 } for i in sorted_indices[:topk]
             ]
-            pred['top_predictions'] = top_preds
+            pred['predictions'] = top_preds
         results.append(pred)
 
         # Visualization using external module
@@ -136,13 +136,64 @@ def make_predictions(model, config, texts, device, args, tokenizers=None, vocabs
                 model_dir_name = model_path.parent.name if model_path.is_file() else model_path.name
                 vis_dir = Path('visualizations') / model_dir_name
                 vis_dir.mkdir(parents=True, exist_ok=True)
-                if 'word_importances' in pred:
-                    words = pred['word_importances']['words']
-                    importances = pred['word_importances']['importances']
-                    plot_word_importances(words, importances, text, vis_dir, idx=idx)
-                if 'ensemble_votes' in pred:
-                    votes = pred['ensemble_votes']
-                    plot_ensemble_votes(votes, text, vis_dir, idx=idx)
+                saved_files = []
+                plot_types = []
+
+                # 1. Ensemble votes (if present)
+                # Try to plot submodel probabilities if available
+                submodel_probs = None
+                if 'ensemble_submodel_explanations' in pred and pred['ensemble_submodel_explanations']:
+                    submodel_probs = {
+                        submodel: sub_expl['probabilities']
+                        for submodel, sub_expl in pred['ensemble_submodel_explanations'].items()
+                        if 'probabilities' in sub_expl
+                    }
+                if 'ensemble_votes' in pred and pred['ensemble_votes']:
+                    fname = plot_ensemble_votes(pred['ensemble_votes'], text, vis_dir, idx=idx, submodel_probs=submodel_probs)
+                    saved_files.append(fname)
+                    plot_types.append('ensemble_votes')
+
+                # 2. Submodel explanations (if present)
+                if 'ensemble_submodel_explanations' in pred and pred['ensemble_submodel_explanations']:
+                    for submodel_name, sub_expl in pred['ensemble_submodel_explanations'].items():
+                        wi = sub_expl.get('word_importances')
+                        if wi and len(set(wi['importances'])) > 1:
+                            fname = plot_word_importances(wi['words'], wi['importances'], text, vis_dir, idx=f"{idx}_{submodel_name}")
+                            saved_files.append(fname)
+                            plot_types.append(f'submodel_word_importances_{submodel_name}')
+                        # Confidence progression for submodel (if present)
+                        cp = sub_expl.get('confidence_progression')
+                        if cp and 'tokens' in cp and 'confidences' in cp and len(cp['tokens']) == len(cp['confidences']):
+                            fname = plot_confidence_progression(cp['tokens'], cp['confidences'], text, vis_dir, idx=f"{idx}_{submodel_name}")
+                            saved_files.append(fname)
+                            plot_types.append(f'submodel_confidence_progression_{submodel_name}')
+
+                # 3. Main model word importances (if present and not uniform/fake)
+                wi = pred.get('word_importances')
+                if wi and len(set(wi['importances'])) > 1:
+                    fname = plot_word_importances(wi['words'], wi['importances'], text, vis_dir, idx=idx)
+                    saved_files.append(fname)
+                    plot_types.append('main_word_importances')
+
+                # 4. Main model confidence progression (if present)
+                cp = pred.get('confidence_progression')
+                if cp and 'tokens' in cp and 'confidences' in cp and len(cp['tokens']) == len(cp['confidences']):
+                    fname = plot_confidence_progression(cp['tokens'], cp['confidences'], text, vis_dir, idx=idx)
+                    saved_files.append(fname)
+                    plot_types.append('main_confidence_progression')
+
+                # 5. If no meaningful explanation, create a summary txt file for the prediction
+                if not saved_files:
+                    summary_path = vis_dir / f'prediction_{idx}_summary.txt'
+                    with open(summary_path, 'w', encoding='utf-8') as f:
+                        f.write(f"Text: {text}\n")
+                        f.write(f"Predicted emotion: {pred.get('emotion')}\n")
+                    saved_files.append(str(summary_path))
+                    print(f"No plot generated for prediction {idx}, summary saved:")
+                else:
+                    print(f"Plots generated for prediction {idx}: {', '.join(plot_types)}")
+                for fname in saved_files:
+                    print(f"[Visualization saved] {fname}")
             except Exception as ve:
                 logger.warning(f"Visualization failed: {ve}")
     return results

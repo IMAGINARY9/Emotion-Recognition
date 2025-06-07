@@ -688,6 +688,100 @@ class EmotionPredictor:
                     output = self.model(**batch_dict)
                 logits = output['logits']
                 probabilities = F.softmax(logits, dim=-1)
+                # --- ENSEMBLE EXPLANATIONS ---
+                # Collect submodel votes and explanations if possible
+                ensemble_votes = {}
+                ensemble_submodel_explanations = {}
+                if hasattr(self.model, 'models'):
+                    for i, submodel in enumerate(self.model.models):
+                        submodel_name = type(submodel).__name__
+                        # Try to get submodel input
+                        sub_input = None
+                        if 'distilbert' in submodel_name.lower() and 'distilbert' in batch_dict:
+                            sub_input = batch_dict['distilbert']
+                        elif ('roberta' in submodel_name.lower() or 'twitterroberta' in submodel_name.lower()) and 'twitter-roberta' in batch_dict:
+                            sub_input = batch_dict['twitter-roberta']
+                        elif 'bilstm' in submodel_name.lower() and 'bilstm' in batch_dict:
+                            sub_input = batch_dict['bilstm']
+                        if sub_input is not None:
+                            sub_out = submodel(**sub_input)
+                            sub_logits = sub_out['logits']
+                            sub_probs = F.softmax(sub_logits, dim=-1)
+                            sub_pred = torch.argmax(sub_logits, dim=-1).item()
+                            sub_label = self.label_names[sub_pred]
+                            ensemble_votes[submodel_name] = sub_label
+                            # --- Submodel explanations ---
+                            sub_expl = {}
+                            # Word importances
+                            if 'bilstm' in submodel_name.lower() and hasattr(submodel, 'use_attention') and submodel.use_attention:
+                                # Try to extract attention weights
+                                if hasattr(submodel, 'attention') and hasattr(submodel.attention, 'last_attention_weights'):
+                                    attn = submodel.attention.last_attention_weights
+                                    if attn is not None:
+                                        tokens = batch[0]['text'].split()
+                                        importances = attn[0].cpu().numpy().tolist()[:len(tokens)]
+                                        sub_expl['word_importances'] = {'words': tokens, 'importances': importances}
+                            # For transformers, try to extract attention weights
+                            elif ('distilbert' in submodel_name.lower() or 'roberta' in submodel_name.lower()):
+                                # Try to extract attention weights if available
+                                attentions = None
+                                tokens = None
+                                if hasattr(submodel, 'distilbert') and hasattr(submodel.distilbert, 'config'):
+                                    submodel.distilbert.config.output_attentions = True
+                                if hasattr(submodel, 'roberta') and hasattr(submodel.roberta, 'config'):
+                                    submodel.roberta.config.output_attentions = True
+                                # Run with output_attentions=True
+                                if hasattr(self, 'tokenizer') and self.tokenizer is not None:
+                                    encoding = self.tokenizer(batch[0]['text'], return_tensors='pt', truncation=True)
+                                    encoding = {k: v.to(self.device) for k, v in encoding.items()}
+                                    if 'distilbert' in submodel_name.lower() and hasattr(submodel, 'distilbert'):
+                                        out = submodel.distilbert(**encoding, output_attentions=True)
+                                    elif 'roberta' in submodel_name.lower() and hasattr(submodel, 'roberta'):
+                                        out = submodel.roberta(**encoding, output_attentions=True)
+                                    else:
+                                        out = None
+                                    if out is not None and hasattr(out, 'attentions') and out.attentions is not None:
+                                        attentions = out.attentions  # tuple: (num_layers, batch, num_heads, seq_len, seq_len)
+                                        tokens = self.tokenizer.convert_ids_to_tokens(encoding['input_ids'][0])
+                                # Compute word importances from attentions
+                                if attentions is not None and tokens is not None:
+                                    # Average over all layers and heads, take attention from [CLS] (token 0) to each token
+                                    attn = torch.stack(attentions)  # (num_layers, batch, num_heads, seq_len, seq_len)
+                                    attn = attn[:, 0, :, 0, :]  # (num_layers, num_heads, seq_len)
+                                    attn = attn.mean(dim=0).mean(dim=0)  # (seq_len,)
+                                    importances = attn.cpu().numpy().tolist()
+                                    # Remove special tokens if needed
+                                    if tokens[0] in ['[CLS]', '<s>']:
+                                        tokens = tokens[1:]
+                                        importances = importances[1:]
+                                    if tokens and tokens[-1] in ['[SEP]', '</s>']:
+                                        tokens = tokens[:-1]
+                                        importances = importances[:-1]
+                                    sub_expl['word_importances'] = {'words': tokens, 'importances': importances}
+                                else:
+                                    # Fallback: uniform importances
+                                    if hasattr(self, 'tokenizer') and self.tokenizer is not None:
+                                        tokens = self.tokenizer.tokenize(batch[0]['text'])
+                                    else:
+                                        tokens = batch[0]['text'].split()
+                                    importances = [1.0 / len(tokens)] * len(tokens) if tokens else []
+                                    sub_expl['word_importances'] = {'words': tokens, 'importances': importances}
+                            # Confidence progression (simulate for BiLSTM)
+                            if 'bilstm' in submodel_name.lower():
+                                tokens = batch[0]['text'].split()
+                                confidences = []
+                                for j in range(1, len(tokens)+1):
+                                    ids = [submodel.vocab.get(tok, submodel.vocab.get('<UNK>', 1)) for tok in tokens[:j]]
+                                    ids += [submodel.vocab.get('<PAD>', 0)] * (submodel.embedding.num_embeddings - len(ids))
+                                    ids_tensor = torch.tensor([ids], dtype=torch.long, device=self.device)
+                                    out = submodel(input_ids=ids_tensor)
+                                    probs = F.softmax(out['logits'], dim=-1)
+                                    conf = probs[0].max().item()
+                                    confidences.append(conf)
+                                sub_expl['confidence_progression'] = {'tokens': tokens, 'confidences': confidences}
+                            # Save submodel probabilities for ensemble plot
+                            sub_expl['probabilities'] = {label: sub_probs[0, idx].item() for idx, label in enumerate(self.label_names)}
+                            ensemble_submodel_explanations[submodel_name] = sub_expl
                 for i, text in enumerate(texts):
                     predicted_class = torch.argmax(logits[i]).item()
                     predicted_emotion = self.label_names[predicted_class]
@@ -703,6 +797,10 @@ class EmotionPredictor:
                             for emotion, prob in zip(self.label_names, probabilities[i])
                         }
                         result['probabilities'] = prob_dict
+                    if ensemble_votes:
+                        result['ensemble_votes'] = ensemble_votes
+                    if ensemble_submodel_explanations:
+                        result['ensemble_submodel_explanations'] = ensemble_submodel_explanations
                     results.append(result)
             return results[0] if is_single else results
         # --- Single model prediction ---
@@ -712,36 +810,80 @@ class EmotionPredictor:
                 if 'bilstm' in self.model.__class__.__name__.lower():
                     # Tokenize to input_ids using vocab
                     if hasattr(self, 'tokenizer') and self.tokenizer is not None and hasattr(self.tokenizer, 'encode'):
-                        # If a tokenizer is provided and has encode, use it (rare for BiLSTM)
                         input_ids = torch.tensor([self.tokenizer.encode(text)], dtype=torch.long, device=self.device)
                     else:
-                        # Use vocab to convert text to input_ids
                         vocab = getattr(self.model, 'vocab', None)
                         if vocab is None:
                             raise ValueError("BiLSTM model requires a vocab for tokenization.")
                         tokens = text.split()
                         input_ids = torch.tensor([[vocab.get(token, vocab.get('<unk>', 0)) for token in tokens]], dtype=torch.long, device=self.device)
                     output = self.model(input_ids=input_ids)
+                    logits = output['logits']
+                    probabilities = F.softmax(logits, dim=-1)
+                    predicted_class = torch.argmax(logits, dim=-1).item()
+                    predicted_emotion = self.label_names[predicted_class]
+                    confidence = probabilities[0, predicted_class].item()
+                    result = {
+                        'text': text,
+                        'emotion': predicted_emotion,
+                        'confidence': confidence
+                    }
+                    if return_probabilities:
+                        prob_dict = {
+                            emotion: prob.item() 
+                            for emotion, prob in zip(self.label_names, probabilities[0])
+                        }
+                        result['probabilities'] = prob_dict
+                    tokens = text.split()
+                    # --- BiLSTM attention word importances ---
+                    if hasattr(self.model, 'use_attention') and self.model.use_attention and hasattr(self.model, 'attention') and hasattr(self.model.attention, 'last_attention_weights'):
+                        attn = self.model.attention.last_attention_weights
+                        if attn is not None:
+                            importances = attn[0].cpu().numpy().tolist()[:len(tokens)]
+                            result['word_importances'] = {'words': tokens, 'importances': importances}
+                    else:
+                        # Fallback: uniform importances
+                        importances = [1.0 / len(tokens)] * len(tokens) if tokens else []
+                        result['word_importances'] = {'words': tokens, 'importances': importances}
+                    # --- BiLSTM confidence progression ---
+                    confidences = []
+                    for j in range(1, len(tokens)+1):
+                        ids = [self.model.vocab.get(tok, self.model.vocab.get('<UNK>', 1)) for tok in tokens[:j]]
+                        ids += [self.model.vocab.get('<PAD>', 0)] * (self.model.embedding.num_embeddings - len(ids))
+                        ids_tensor = torch.tensor([ids], dtype=torch.long, device=self.device)
+                        out = self.model(input_ids=ids_tensor)
+                        probs = F.softmax(out['logits'], dim=-1)
+                        conf = probs[0].max().item()
+                        confidences.append(conf)
+                    result['confidence_progression'] = {'tokens': tokens, 'confidences': confidences}
+                    results.append(result)
                 else:
                     # Transformer path (DistilBERT, RoBERTa, etc.)
+                    # Try to extract attention weights if possible
+                    # (requires output_attentions=True in config, not always available)
                     output = self.model(text=[text], debug_predictions=debug_predictions) if 'debug_predictions' in self.model.forward.__code__.co_varnames else self.model(text=[text])
-                logits = output['logits']
-                probabilities = F.softmax(logits, dim=-1)
-                predicted_class = torch.argmax(logits, dim=-1).item()
-                predicted_emotion = self.label_names[predicted_class]
-                confidence = probabilities[0, predicted_class].item()
-                result = {
-                    'text': text,
-                    'emotion': predicted_emotion,
-                    'confidence': confidence
-                }
-                if return_probabilities:
-                    prob_dict = {
-                        emotion: prob.item() 
-                        for emotion, prob in zip(self.label_names, probabilities[0])
+                    logits = output['logits']
+                    probabilities = F.softmax(logits, dim=-1)
+                    predicted_class = torch.argmax(logits, dim=-1).item()
+                    predicted_emotion = self.label_names[predicted_class]
+                    confidence = probabilities[0, predicted_class].item()
+                    result = {
+                        'text': text,
+                        'emotion': predicted_emotion,
+                        'confidence': confidence
                     }
-                    result['probabilities'] = prob_dict
-                results.append(result)
+                    if return_probabilities:
+                        prob_dict = {
+                            emotion: prob.item() 
+                            for emotion, prob in zip(self.label_names, probabilities[0])
+                        }
+                        result['probabilities'] = prob_dict
+                    # --- Transformer attention word importances (placeholder: uniform) ---
+                    tokens = text.split()
+                    importances = [1.0 / len(tokens)] * len(tokens) if tokens else []
+                    result['word_importances'] = {'words': tokens, 'importances': importances}
+                    # Confidence progression for transformers is not directly available; skip for now
+                    results.append(result)
         return results[0] if is_single else results
 
 def create_model(model_type, model_config=None, vocab=None, **kwargs):
