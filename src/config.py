@@ -160,7 +160,7 @@ class ConfigManager:
         Returns:
             Model configuration
         """
-        config_path = self.config_dir / model_type
+        config_path = self.config_dir / f"{model_type}_config.yaml"
         
         return self.load_config(config_path)
     

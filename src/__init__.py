@@ -38,7 +38,7 @@ from .training import EmotionTrainer
 
 from .evaluation import EmotionEvaluator
 
-from .data_utils import (
+from utils.data_utils import (
     EmotionDataLoader,
     setup_data_directories,
     download_sample_data

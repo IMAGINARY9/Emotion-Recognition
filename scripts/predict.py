@@ -28,6 +28,7 @@ from src.preprocessing import EmotionPreprocessor
 from src.models import create_model, EmotionPredictor
 from utils.model_loading import load_model_and_assets, filter_model_config
 from src.visualization import plot_word_importances, plot_ensemble_votes, plot_confidence_progression
+from utils.training_utils import create_datasets
 
 logger = logging.getLogger(__name__)
 
@@ -252,6 +253,21 @@ def main():
         
         # Load input data
         texts = load_input_texts(args)
+        
+        # If batch/CSV prediction, use create_datasets to preprocess and batch input
+        if args.csv_file:
+            logger.info("Creating datasets for batch prediction...")
+            dataset = create_datasets(
+                args.csv_file,
+                text_column=args.text_column,
+                batch_size=args.batch_size,
+                tokenizer=tokenizers.get('distilbert') or tokenizers.get('twitter-roberta'),
+                max_length=config.preprocessing.max_length,
+                device=device
+            )
+            logger.info(f"Loaded {len(dataset)} batches from CSV file")
+            # Flatten dataset for prediction
+            texts = [item['text'] for batch in dataset for item in batch]
         
         # Make predictions
         predictions = make_predictions(model, config, texts, device, args, tokenizers=tokenizers, vocabs=vocabs)

@@ -149,6 +149,69 @@ class EmotionEvaluator:
         
         return metrics
     
+    def evaluate_model_from_dataloader(self, dataloader, debug_predictions: bool = False) -> Dict:
+        """
+        Evaluate the model using a provided DataLoader (for joint ensemble evaluation).
+        
+        Args:
+            dataloader: DataLoader yielding batches in the correct structure for the model
+            debug_predictions: Whether to enable debug predictions (if supported by the model)
+            
+        Returns:
+            Dictionary containing all evaluation metrics
+        """
+        self.logger.info(f"Evaluating model from DataLoader with {len(dataloader.dataset)} samples")
+        all_predictions = []
+        all_probabilities = []
+        all_labels = []
+        with torch.no_grad():
+            for batch in dataloader:
+                batch_on_device = {}
+                for k, v in batch.items():
+                    if isinstance(v, dict):
+                        batch_on_device[k] = {kk: vv.to(self.device) for kk, vv in v.items()}
+                    elif isinstance(v, torch.Tensor):
+                        batch_on_device[k] = v.to(self.device)
+                    else:
+                        batch_on_device[k] = v
+                outputs = self.model(**batch_on_device, debug_predictions=debug_predictions)
+                logits = outputs['logits']
+                labels_batch = batch_on_device['labels']
+                probabilities = torch.softmax(logits, dim=-1)
+                predictions = torch.argmax(logits, dim=-1)
+                all_predictions.extend(predictions.cpu().numpy())
+                all_probabilities.extend(probabilities.cpu().numpy())
+                all_labels.extend(labels_batch.cpu().numpy())
+        
+        # Calculate metrics and generate report as in evaluate_model
+        metrics = self._calculate_metrics(all_labels, all_predictions, all_probabilities)
+        cm = confusion_matrix(all_labels, all_predictions)
+        metrics['confusion_matrix'] = cm
+        class_report = classification_report(
+            all_labels, all_predictions,
+            target_names=self.emotion_names,
+            output_dict=True,
+            zero_division=0
+        )
+        metrics['classification_report'] = class_report
+        error_analysis = self._perform_error_analysis(
+            [None]*len(all_labels), all_labels, all_predictions, all_probabilities
+        )
+        metrics['error_analysis'] = error_analysis
+        self.logger.info(f"Evaluation completed. Overall accuracy: {metrics['accuracy']:.4f}")
+        # Save JSON report and plots (skip text-based plots since we don't have texts)
+        model_name = getattr(self.model, 'name', self.model.__class__.__name__)
+        report_path = self.generate_evaluation_report(metrics, [None]*len(all_labels), all_labels, model_name=model_name)
+        self.logger.info(f"Saved JSON evaluation report to: {report_path}")
+        cm_path = self.save_dir / f"confusion_matrix_{model_name}.png"
+        self.plot_confusion_matrix(metrics['confusion_matrix'], save_path=str(cm_path))
+        self.logger.info(f"Saved confusion matrix plot to: {cm_path}")
+        pcm_path = self.save_dir / f"per_class_metrics_{model_name}.png"
+        self.plot_per_class_metrics(metrics, save_path=str(pcm_path))
+        self.logger.info(f"Saved per-class metrics plot to: {pcm_path}")
+        
+        return metrics
+    
     def _get_predictions(self, 
                         texts: List[str], 
                         labels: List[int],
@@ -165,34 +228,50 @@ class EmotionEvaluator:
         dataset = EmotionDataset(texts, labels, self.tokenizer, max_length)
         collate_fn = getattr(dataset, 'get_collate_fn', lambda: None)()
         dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
-        
+
         all_predictions = []
         all_probabilities = []
         all_labels = []
-        
+
+        is_ensemble = hasattr(self.model, 'models')  # crude check for ensemble
+
         with torch.no_grad():
             for batch in dataloader:
-                input_ids = batch['input_ids'].to(self.device)
-                labels_batch = batch['label'].to(self.device)
-                # Only pass attention_mask if model expects it (transformers)
-                if self.tokenizer and ('distilbert' in self.model.__class__.__name__.lower() or 'roberta' in self.model.__class__.__name__.lower()):
-                    attention_mask = batch['attention_mask'].to(self.device)
-                    if hasattr(self.model, 'forward') and 'debug_predictions' in self.model.forward.__code__.co_varnames:
-                        outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, debug_predictions=debug_predictions)
-                    else:
-                        outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
+                if is_ensemble:
+                    # For ensemble: pass batch as-is (with submodel keys)
+                    batch_on_device = {}
+                    for k, v in batch.items():
+                        if isinstance(v, dict):
+                            batch_on_device[k] = {kk: vv.to(self.device) for kk, vv in v.items()}
+                        elif isinstance(v, torch.Tensor):
+                            batch_on_device[k] = v.to(self.device)
+                        else:
+                            batch_on_device[k] = v
+                    outputs = self.model(**batch_on_device, debug_predictions=debug_predictions)
+                    logits = outputs['logits']
+                    labels_batch = batch_on_device['labels']
                 else:
-                    if hasattr(self.model, 'forward') and 'debug_predictions' in self.model.forward.__code__.co_varnames:
-                        outputs = self.model(input_ids=input_ids, debug_predictions=debug_predictions)
+                    input_ids = batch['input_ids'].to(self.device)
+                    labels_batch = batch['label'].to(self.device)
+                    # Only pass attention_mask if model expects it (transformers)
+                    if self.tokenizer and ('distilbert' in self.model.__class__.__name__.lower() or 'roberta' in self.model.__class__.__name__.lower()):
+                        attention_mask = batch['attention_mask'].to(self.device)
+                        if hasattr(self.model, 'forward') and 'debug_predictions' in self.model.forward.__code__.co_varnames:
+                            outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, debug_predictions=debug_predictions)
+                        else:
+                            outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
                     else:
-                        outputs = self.model(input_ids=input_ids)
-                logits = outputs['logits']
+                        if hasattr(self.model, 'forward') and 'debug_predictions' in self.model.forward.__code__.co_varnames:
+                            outputs = self.model(input_ids=input_ids, debug_predictions=debug_predictions)
+                        else:
+                            outputs = self.model(input_ids=input_ids)
+                    logits = outputs['logits']
                 probabilities = torch.softmax(logits, dim=-1)
                 predictions = torch.argmax(logits, dim=-1)
                 all_predictions.extend(predictions.cpu().numpy())
                 all_probabilities.extend(probabilities.cpu().numpy())
                 all_labels.extend(labels_batch.cpu().numpy())
-        
+
         return all_predictions, all_probabilities, all_labels
     
     def _calculate_metrics(self, 
@@ -255,8 +334,13 @@ class EmotionEvaluator:
         
         error_analysis['most_confident_errors'] = []
         for i, confidence in wrong_confidences[:10]:  # Top 10
+            text_val = texts[i]
+            if text_val is None:
+                text_str = "<no text>"
+            else:
+                text_str = text_val[:100] + "..." if len(text_val) > 100 else text_val
             error_analysis['most_confident_errors'].append({
-                'text': texts[i][:100] + "..." if len(texts[i]) > 100 else texts[i],
+                'text': text_str,
                 'true_emotion': self.emotion_names[int(labels[i])],
                 'predicted_emotion': self.emotion_names[int(predictions[i])],
                 'confidence': confidence

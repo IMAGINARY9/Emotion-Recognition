@@ -536,33 +536,25 @@ class EnsembleEmotionModel(nn.Module):
         """
         logits_list = []
         successful_indices = []
+        # Only lowercase top-level keys, do NOT replace underscores with dashes
+        normalized_inputs = {k.lower(): v for k, v in inputs.items()}
         for i, model in enumerate(self.models):
             try:
-                model_name = type(model).__name__.lower()
+                model_name = type(model).__name__.lower().replace('_', '-')
+                # Map model_name to input key
                 if 'distilbert' in model_name:
-                    for key in ['distilbert', 'distilbert-emotion', 'distilbert_emotion']:
-                        if key in inputs:
-                            sub_inputs = inputs[key]
-                            outputs = model(**sub_inputs, labels=inputs['labels'])
-                            break
-                    else:
-                        raise ValueError(f"No matching input for model {model_name}. Available keys: {list(inputs.keys())}")
-                elif 'roberta' in model_name or 'twitterroberta' in model_name:
-                    for key in ['twitter-roberta', 'twitter_roberta', 'roberta', 'roberta-emotion', 'roberta_emotion']:
-                        if key in inputs:
-                            sub_inputs = inputs[key]
-                            outputs = model(**sub_inputs, labels=inputs['labels'])
-                            break
-                    else:
-                        raise ValueError(f"No matching input for model {model_name}. Available keys: {list(inputs.keys())}")
+                    key = 'distilbert'
+                elif 'roberta' in model_name or 'twitterroberta' in model_name or 'twitter-roberta' in model_name:
+                    key = 'twitter-roberta'
                 elif 'bilstm' in model_name:
-                    if 'bilstm' in inputs:
-                        sub_inputs = inputs['bilstm']
-                        outputs = model(**sub_inputs, labels=inputs['labels'])
-                    else:
-                        raise ValueError(f"No matching input for model {model_name}. Available keys: {list(inputs.keys())}")
+                    key = 'bilstm'
                 else:
-                    raise ValueError(f"No matching input for model {model_name}. Available keys: {list(inputs.keys())}")
+                    raise ValueError(f"Unknown submodel type: {model_name}")
+                if key in normalized_inputs and normalized_inputs[key] is not None:
+                    sub_inputs = normalized_inputs[key]
+                    outputs = model(**sub_inputs, labels=normalized_inputs.get('labels'))
+                else:
+                    raise ValueError(f"No matching input for model {model_name}. Available keys: {list(normalized_inputs.keys())}")
                 logits_list.append(outputs['logits'])
                 successful_indices.append(i)
             except Exception as e:
@@ -585,9 +577,9 @@ class EnsembleEmotionModel(nn.Module):
         for weight, logits in zip(normalized_weights, logits_list):
             weighted_logits += weight * logits
         result = {'logits': weighted_logits}
-        if 'labels' in inputs and inputs['labels'] is not None:
+        if 'labels' in normalized_inputs and normalized_inputs['labels'] is not None:
             loss_fct = nn.CrossEntropyLoss()
-            loss = loss_fct(weighted_logits, inputs['labels'])
+            loss = loss_fct(weighted_logits, normalized_inputs['labels'])
             result['loss'] = loss
         # Debug: check if all predictions are for a single class (with mapped label)
         if debug_predictions:
@@ -599,8 +591,6 @@ class EnsembleEmotionModel(nn.Module):
                 unique_labels = self._idx_to_label(unique)
                 print(f"[Ensemble Debug] Final weighted logits[0]: {sample_weighted_logits}")
                 print(f"[Ensemble Debug] Final ensemble predictions: {preds[:5]} ({pred_labels}), unique classes: {unique} ({unique_labels})")
-                if unique.numel() == 1:
-                    print(f"[Ensemble Warning] All ensemble predictions are for class {unique.item()} ({unique_labels[0]}) in this batch.")
         return result
 
 class EmotionPredictor:
@@ -897,6 +887,12 @@ def create_model(model_type, model_config=None, vocab=None, **kwargs):
     Returns:
         Initialized model
     """
+    # Remove 'type' and 'weight' keys if present to avoid passing them to model constructors
+    if model_config:
+        model_config = dict(model_config)  # Make a copy to avoid side effects
+        model_config.pop('type', None)
+        model_config.pop('weight', None)
+        
     if model_type.lower() == "bilstm":
         vocab_size = None
         embedding_dim = None

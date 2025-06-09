@@ -29,7 +29,7 @@ from models import EmotionDataset, create_model
 from preprocessing import EmotionPreprocessor
 from src.losses import FocalLoss
 from enhanced_datasets import EnhancedBiLSTMDataset, JointEnsembleDataset
-from vocab_utils import BiLSTMVocabularyBuilder
+from utils.vocab_utils import BiLSTMVocabularyBuilder
 
 class EmotionTrainer:
     """
@@ -77,9 +77,10 @@ class EmotionTrainer:
         self.gradient_clipping = gradient_clipping
         self.save_dir = Path(save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True)
-        
+        self.scaler = None # Initialize scaler for AMP
+
         self.emotion_names = emotion_names or ['sadness', 'joy', 'love', 'anger', 'fear', 'surprise']
-        self.class_weights = class_weights
+        self.class_weights = class_weights.to(self.device) if class_weights is not None else None
         
         # Training history
         self.history = {
@@ -210,7 +211,7 @@ class EmotionTrainer:
         
         return train_loader, val_loader
     
-    def train_epoch(self, train_loader: DataLoader, optimizer, scheduler=None, debug_predictions: bool = False) -> Tuple[float, float, float, Dict]:
+    def train_epoch(self, train_loader: DataLoader, optimizer, scheduler=None, debug_predictions: bool = False, use_amp: bool = False) -> Tuple[float, float, float, Dict]:
         """
         Train for one epoch.
         
@@ -218,6 +219,7 @@ class EmotionTrainer:
             train_loader: Training data loader
             optimizer: Optimizer
             scheduler: Learning rate scheduler
+            use_amp: Whether to use Automatic Mixed Precision
             
         Returns:
             Tuple of average loss, accuracy, F1 score, and prediction distribution
@@ -229,83 +231,94 @@ class EmotionTrainer:
         
         progress_bar = tqdm(train_loader, desc="Training")
         
-        for batch in progress_bar:
-            # Joint ensemble: batch is a dict with submodel keys
-            if any(k in batch for k in ['distilbert', 'twitter-roberta', 'bilstm']):
-                for k in batch:
+        if use_amp and self.scaler is None and self.device == 'cuda': # Initialize scaler only if using AMP and on CUDA
+            self.scaler = torch.cuda.amp.GradScaler()
+
+        for batch_idx, batch in enumerate(progress_bar):
+            optimizer.zero_grad()
+
+            # Determine if it's a joint ensemble batch
+            is_joint_ensemble_batch = any(k in batch for k in ['distilbert', 'twitter-roberta', 'bilstm'])
+
+            if is_joint_ensemble_batch:
+                for k in batch: # Move all tensor data to device
                     if isinstance(batch[k], dict):
                         for subk in batch[k]:
-                            batch[k][subk] = batch[k][subk].to(self.device)
-                labels = batch['labels'].to(self.device)
-                # Only pass debug_predictions if model is ensemble
-                if hasattr(self.model, 'is_ensemble') or 'Ensemble' in self.model.__class__.__name__:
-                    outputs = self.model(**batch, debug_predictions=debug_predictions)
-                else:
-                    outputs = self.model(**batch)
-            else:
-                # Single model
-                if self.tokenizer:
+                            if isinstance(batch[k][subk], torch.Tensor):
+                                batch[k][subk] = batch[k][subk].to(self.device)
+                    elif isinstance(batch[k], torch.Tensor):
+                         batch[k] = batch[k].to(self.device)
+                labels = batch['labels'].to(self.device) # Ensure labels are on device
+            else: # Single model batch
+                labels = batch['label'].to(self.device)
+                if self.tokenizer: # For HuggingFace models
                     input_ids = batch['input_ids'].to(self.device)
                     attention_mask = batch['attention_mask'].to(self.device)
-                    labels = batch['label'].to(self.device)
-                    if hasattr(self.model, 'is_ensemble') or 'Ensemble' in self.model.__class__.__name__:
-                        outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, labels=labels, debug_predictions=debug_predictions)
-                    else:
-                        outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-                else:
+                else: # For models not using HuggingFace tokenizers (e.g. some BiLSTMs)
                     input_ids = batch['input_ids'].to(self.device)
-                    labels = batch['label'].to(self.device)
+              # Autocast for mixed precision
+            with torch.autocast(device_type='cuda', enabled=(use_amp and self.device == 'cuda')):
+                if is_joint_ensemble_batch:
+                    # Only pass submodel keys and 'labels' to the ensemble model
+                    model_inputs = {k: v for k, v in batch.items() if k in ['distilbert', 'twitter-roberta', 'bilstm', 'labels'] and v is not None}
                     if hasattr(self.model, 'is_ensemble') or 'Ensemble' in self.model.__class__.__name__:
-                        outputs = self.model(input_ids=input_ids, labels=labels, debug_predictions=debug_predictions)
+                        outputs = self.model(**model_inputs, debug_predictions=debug_predictions)
                     else:
-                        outputs = self.model(input_ids=input_ids, labels=labels)
-            
-            loss = outputs.get('loss') # Use .get() to safely access 'loss'
-            logits = outputs['logits']
+                        outputs = self.model(**model_inputs)
+                else: # Single model
+                    if self.tokenizer:
+                        if hasattr(self.model, 'is_ensemble') or 'Ensemble' in self.model.__class__.__name__:
+                            outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, labels=labels, debug_predictions=debug_predictions)
+                        else:
+                            outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+                    else: # Non-HF model (e.g. BiLSTM)
+                        if hasattr(self.model, 'is_ensemble') or 'Ensemble' in self.model.__class__.__name__:
+                            outputs = self.model(input_ids=input_ids, labels=labels, debug_predictions=debug_predictions)
+                        else:
+                            outputs = self.model(input_ids=input_ids, labels=labels)
 
-            # If model's forward pass didn't compute loss (e.g., returned None), compute it here
-            if loss is None and labels is not None:
-                if self.loss_type == 'cross_entropy':
-                    loss_fct = nn.CrossEntropyLoss(weight=self.class_weights, label_smoothing=self.label_smoothing if hasattr(self, 'label_smoothing') else 0.0)
-                    loss = loss_fct(logits, labels)
-                elif self.loss_type == 'focal':
-                    # Ensure gamma and label_smoothing are available, provide defaults if not
-                    gamma = getattr(self, 'gamma', 2.0) 
-                    label_smoothing = getattr(self, 'label_smoothing', 0.0)
-                    loss_fct = FocalLoss(gamma=gamma, weight=self.class_weights, label_smoothing=label_smoothing)
-                    loss = loss_fct(logits, labels)
-                # Add other loss types here if necessary
-                elif hasattr(self.model, 'loss_fct'): # Fallback to model's own loss_fct if defined
-                    loss = self.model.loss_fct(logits, labels)
-                else:
-                    # This case should ideally not be reached if labels are present and a loss_type is specified
-                    # Or if the model is expected to always return a loss when labels are given.
-                    # Consider raising an error or logging a warning.
-                    self.logger.error("Loss is None and could not be computed in trainer. Ensure model's forward returns loss or trainer's loss_type is correctly configured.")
-                    # To prevent crash, but this indicates a setup problem:
-                    # loss = torch.tensor(0.0, device=self.device, requires_grad=True) # Placeholder, not ideal
+                loss = outputs.get('loss') 
+                logits = outputs['logits']
+
+                if loss is None and labels is not None:
+                    if self.loss_type == 'cross_entropy':
+                        loss_fct = nn.CrossEntropyLoss(weight=self.class_weights, 
+                                                      label_smoothing=self.label_smoothing if hasattr(self, 'label_smoothing') else 0.0)
+                        loss = loss_fct(logits, labels)
+                    elif self.loss_type == 'focal':
+                        gamma = getattr(self, 'gamma', 2.0) 
+                        label_smoothing = getattr(self, 'label_smoothing', 0.0)
+                        loss_fct = FocalLoss(gamma=gamma, weight=self.class_weights, 
+                                             label_smoothing=label_smoothing)
+                        loss = loss_fct(logits, labels)
+                    elif hasattr(self.model, 'loss_fct'):
+                        loss = self.model.loss_fct(logits, labels)
+                    else:
+                        self.logger.error("Loss is None and could not be computed in trainer. Ensure model's forward returns loss or trainer's loss_type is correctly configured.")
+                        # loss = torch.tensor(0.0, device=self.device, requires_grad=True) # Avoid crash
 
             # Backward pass
-            if loss is not None: # Ensure loss is not None before backward pass
-                optimizer.zero_grad()
-                loss.backward()
-            
-                # Gradient clipping
-                if self.gradient_clipping > 0:
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.gradient_clipping)
-            
-                optimizer.step()
+            if loss is not None:
+                if use_amp and self.device == 'cuda':
+                    self.scaler.scale(loss).backward()
+                    if self.gradient_clipping > 0:
+                        self.scaler.unscale_(optimizer) 
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.gradient_clipping)
+                    self.scaler.step(optimizer)
+                    self.scaler.update()
+                else: # No AMP or not on CUDA
+                    loss.backward()
+                    if self.gradient_clipping > 0:
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.gradient_clipping)
+                    optimizer.step()
             
                 if scheduler:
                     scheduler.step()
             
-                # Update metrics
-                total_loss += loss.item() if loss is not None else 0 # Handle if loss ended up None
+                total_loss += loss.item()
             else:
-                # If loss is still None here, it means it wasn't computed and backward pass was skipped.
-                # This might happen if labels were not provided, or if there's a config issue.                # Log this situation if it's unexpected during training with labels.
-                if labels is not None:
-                    self.logger.warning("Loss was None during training epoch, backward pass skipped. Check model output and loss configuration.")
+                if labels is not None: # Only warn if labels were present, implying loss should have been computed
+                    self.logger.warning(f"Loss was None at batch {batch_idx}, backward pass skipped. Check model output and loss configuration.")
             
             predictions = torch.argmax(logits, dim=-1)
             all_predictions.extend(predictions.cpu().numpy())
@@ -331,12 +344,13 @@ class EmotionTrainer:
         
         return avg_loss, accuracy, f1, pred_dist
 
-    def validate(self, val_loader: DataLoader, debug_predictions: bool = False) -> Tuple[float, float, float, Dict]:
+    def validate(self, val_loader: DataLoader, debug_predictions: bool = False, use_amp: bool = False) -> Tuple[float, float, float, Dict]:
         """
         Validate the model.
         
         Args:
             val_loader: Validation data loader
+            use_amp: Whether to use Automatic Mixed Precision
             
         Returns:
             Tuple of average loss, accuracy, F1 score, and detailed metrics
@@ -347,62 +361,70 @@ class EmotionTrainer:
         all_labels = []
         
         with torch.no_grad():
-            for batch in tqdm(val_loader, desc="Validation"):
-                if any(k in batch for k in ['distilbert', 'twitter-roberta', 'bilstm']):
-                    for k in batch:
+            for batch_idx, batch in enumerate(tqdm(val_loader, desc="Validation")):
+                is_joint_ensemble_batch = any(k in batch for k in ['distilbert', 'twitter-roberta', 'bilstm'])
+
+                if is_joint_ensemble_batch:
+                    for k in batch: # Move all tensor data to device
                         if isinstance(batch[k], dict):
                             for subk in batch[k]:
-                                batch[k][subk] = batch[k][subk].to(self.device)
-                    labels = batch['labels'].to(self.device)
-                    if hasattr(self.model, 'is_ensemble') or 'Ensemble' in self.model.__class__.__name__:
-                        outputs = self.model(**batch, debug_predictions=debug_predictions)
-                    else:
-                        outputs = self.model(**batch)
-                else:
-                    if self.tokenizer:
+                                if isinstance(batch[k][subk], torch.Tensor):
+                                    batch[k][subk] = batch[k][subk].to(self.device)
+                        elif isinstance(batch[k], torch.Tensor):
+                            batch[k] = batch[k].to(self.device)
+                    labels = batch['labels'].to(self.device) # Ensure labels are on device
+                else: # Single model batch
+                    labels = batch['label'].to(self.device)
+                    if self.tokenizer: # For HuggingFace models
                         input_ids = batch['input_ids'].to(self.device)
                         attention_mask = batch['attention_mask'].to(self.device)
-                        labels = batch['label'].to(self.device)
-                        if hasattr(self.model, 'is_ensemble') or 'Ensemble' in self.model.__class__.__name__:
-                            outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, labels=labels, debug_predictions=debug_predictions)
-                        else:
-                            outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-                    else:
+                    else: # For models not using HuggingFace tokenizers
                         input_ids = batch['input_ids'].to(self.device)
-                        labels = batch['label'].to(self.device)
-                        if hasattr(self.model, 'is_ensemble') or 'Ensemble' in self.model.__class__.__name__:
-                            outputs = self.model(input_ids=input_ids, labels=labels, debug_predictions=debug_predictions)
-                        else:
-                            outputs = self.model(input_ids=input_ids, labels=labels)
-                
-                logits = outputs['logits']
-                loss = outputs.get('loss')
 
-                # If model's forward pass didn't compute loss (e.g., returned None), compute it here
-                if loss is None and labels is not None:
-                    if self.loss_type == 'cross_entropy':
-                        loss_fct = nn.CrossEntropyLoss(weight=self.class_weights, label_smoothing=self.label_smoothing if hasattr(self, 'label_smoothing') else 0.0)
-                        loss = loss_fct(logits, labels)
-                    elif self.loss_type == 'focal':
-                        gamma = getattr(self, 'gamma', 2.0)
-                        label_smoothing = getattr(self, 'label_smoothing', 0.0)
-                        loss_fct = FocalLoss(gamma=gamma, weight=self.class_weights, label_smoothing=label_smoothing)
-                        loss = loss_fct(logits, labels)
-                    elif hasattr(self.model, 'loss_fct'): # Fallback to model's own loss_fct if defined
-                        loss = self.model.loss_fct(logits, labels)
-                    else:
-                        self.logger.error("Validation loss is None and could not be computed. Check model output and loss configuration.")
-                        # To prevent crash, but this indicates a setup problem:
-                        # loss = torch.tensor(0.0, device=self.device) # Placeholder, not ideal
+                with torch.autocast(device_type='cuda', enabled=(use_amp and self.device == 'cuda')):
+                    if is_joint_ensemble_batch:
+                        model_inputs = {k: v for k, v in batch.items() if k != 'labels'}
+                        if hasattr(self.model, 'is_ensemble') or 'Ensemble' in self.model.__class__.__name__:
+                            outputs = self.model(**model_inputs, labels=labels, debug_predictions=debug_predictions)
+                        else:
+                            outputs = self.model(**model_inputs, labels=labels)
+                    else: # Single model
+                        if self.tokenizer:
+                            if hasattr(self.model, 'is_ensemble') or 'Ensemble' in self.model.__class__.__name__:
+                                outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, labels=labels, debug_predictions=debug_predictions)
+                            else:
+                                outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+                        else: # Non-HF model
+                            if hasattr(self.model, 'is_ensemble') or 'Ensemble' in self.model.__class__.__name__:
+                                outputs = self.model(input_ids=input_ids, labels=labels, debug_predictions=debug_predictions)
+                            else:
+                                outputs = self.model(input_ids=input_ids, labels=labels)
+                    
+                    logits = outputs['logits']
+                    loss = outputs.get('loss')
+
+                    if loss is None and labels is not None:
+                        if self.loss_type == 'cross_entropy':
+                            loss_fct = nn.CrossEntropyLoss(weight=self.class_weights, 
+                                                          label_smoothing=self.label_smoothing if hasattr(self, 'label_smoothing') else 0.0)
+                            loss = loss_fct(logits, labels)
+                        elif self.loss_type == 'focal':
+                            gamma = getattr(self, 'gamma', 2.0)
+                            label_smoothing = getattr(self, 'label_smoothing', 0.0)
+                            loss_fct = FocalLoss(gamma=gamma, weight=self.class_weights, 
+                                                 label_smoothing=label_smoothing)
+                            loss = loss_fct(logits, labels)
+                        elif hasattr(self.model, 'loss_fct'):
+                            loss = self.model.loss_fct(logits, labels)
+                        else:
+                            self.logger.error("Validation loss is None and could not be computed. Check model output and loss configuration.")
+                            # loss = torch.tensor(0.0, device=self.device) # Avoid crash
                 
                 if loss is not None:
                     total_loss += loss.item()
                 else:
-                    # If loss is still None, it means it wasn't computed.
-                    # This might happen if labels were not provided (not typical for validation with labels)
-                    # or if there's a config issue and no fallback was hit.
-                    if labels is not None:
-                        self.logger.warning("Loss was None during validation epoch. Check model output and loss configuration.")
+                    if labels is not None: # Only warn if labels were present
+                        self.logger.warning(f"Validation loss was None at batch {batch_idx}. Check model output and loss configuration.")
 
                 predictions = torch.argmax(logits, dim=-1)
                 all_predictions.extend(predictions.cpu().numpy())
@@ -440,44 +462,49 @@ class EmotionTrainer:
         return avg_loss, accuracy, f1, detailed_metrics
     
     def train(self, 
-              train_texts: List[str] = None, 
-              train_labels: List[int] = None,
-              val_texts: List[str] = None, 
-              val_labels: List[int] = None,
-              num_epochs: int = 5,
-              batch_size: int = 32,
+              train_texts: List[str], 
+              train_labels: List[int], 
+              val_texts: List[str], 
+              val_labels: List[int], 
+              num_epochs: int, 
+              batch_size: int, 
               max_length: int = 128,
-              patience: int = 3,
-              save_best: bool = True,
-              train_loader=None,
-              val_loader=None,
-              debug_predictions: bool = False) -> Dict:
+              use_enhanced_bilstm: bool = False,
+              vocab_builder: Optional[BiLSTMVocabularyBuilder] = None,
+              vocab_save_path: Optional[str] = None,
+              debug_predictions: bool = False,
+              use_amp: bool = False): 
         """
-        Train the emotion recognition model.
-        If train_loader/val_loader are provided, use them directly (for joint ensemble training).
-        Otherwise, create DataLoaders from texts/labels (for individual training).
-        """
-        # Log class distribution and weights
-        if train_texts is not None and train_labels is not None:
-            unique, counts = np.unique(train_labels, return_counts=True)
-            class_dist = dict(zip(unique, counts))
-            self.logger.info(f"Training set class distribution: {class_dist}")
-            if len(class_dist) > 1:
-                max_count = max(counts)
-                min_count = min(counts)
-                if max_count > 10 * min_count:
-                    self.logger.warning(f"Severe class imbalance detected: max/min ratio > 10. Consider upsampling, downsampling, or using stronger class weights.")
-        if self.class_weights is not None:
-            self.logger.info(f"Class weights for loss: {self.class_weights.cpu().numpy().tolist()}")
+        Train the model.
         
-        self.logger.info(f"Starting training with {num_epochs} epochs")
-        if train_loader is None or val_loader is None:
-            self.logger.info("Creating DataLoaders from texts/labels (individual training mode)")
-            train_loader, val_loader = self.create_data_loaders(
-                train_texts, train_labels, val_texts, val_labels, batch_size, max_length
-            )
+        Args:
+            train_texts: Training texts
+            train_labels: Training labels
+            val_texts: Validation texts
+            val_labels: Validation labels
+            num_epochs: Number of epochs
+            batch_size: Batch size
+            max_length: Maximum sequence length
+            use_enhanced_bilstm: Whether to use enhanced BiLSTM dataset
+            vocab_builder: Vocabulary builder for BiLSTM
+            vocab_save_path: Path to save vocabulary
+            debug_predictions: Whether to log debug predictions
+            use_amp: Whether to use Automatic Mixed Precision
+        """
+        self.logger.info(f"Starting training on {self.device} with learning rate {self.learning_rate}")
+        
+        # Determine actual use_amp based on device
+        actual_use_amp = use_amp and (self.device == 'cuda')
+        if self.device == 'cuda':
+            self.logger.info(f"Automatic Mixed Precision (AMP) enabled: {actual_use_amp}")
         else:
-            self.logger.info("Using provided DataLoaders (joint ensemble mode)")
+            self.logger.info(f"Automatic Mixed Precision (AMP) enabled: False (AMP is CUDA only or was disabled in config)")
+
+
+        train_loader, val_loader = self.create_data_loaders(
+            train_texts, train_labels, val_texts, val_labels, batch_size, max_length, use_enhanced_bilstm, vocab_builder, vocab_save_path
+        )
+        
         # Setup optimizer and scheduler
         optimizer = AdamW(self.model.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay)
         total_steps = len(train_loader) * num_epochs
@@ -496,11 +523,9 @@ class EmotionTrainer:
             self.logger.info(f"Epoch {epoch + 1}/{num_epochs}")
             
             # Training
-            train_loss, train_acc, train_f1, train_pred_dist = self.train_epoch(train_loader, optimizer, scheduler, debug_predictions=debug_predictions)
-            
-            # Validation
-            val_loss, val_acc, val_f1, detailed_metrics = self.validate(val_loader, debug_predictions=debug_predictions)
-            val_pred_dist = detailed_metrics.get('prediction_distribution', {})
+            train_loss, train_acc, train_f1, _ = self.train_epoch(train_loader, optimizer, scheduler, debug_predictions=debug_predictions, use_amp=actual_use_amp)
+            val_loss, val_acc, val_f1, _ = self.validate(val_loader, debug_predictions=debug_predictions, use_amp=actual_use_amp)
+            end_time = time.time()
             
             # Detect model collapse on training and validation
             train_all_labels = []
@@ -793,3 +818,179 @@ class EmotionTrainer:
                         param.add_(noise)
         
         self.logger.info(f"Recovery strategy '{recovery_type}' applied")
+
+def train_model_from_config(config_path: str, data_path: str, save_dir: str, debug_predictions: bool = False): # Removed use_amp from signature
+    """
+    Train a model based on a YAML configuration file.
+
+    Args:
+        config_path: Path to the YAML configuration file.
+        data_path: Path to the CSV data file.
+        save_dir: Directory to save the trained model and logs.
+        debug_predictions: Whether to log debug predictions.
+    """
+    with open(config_path, 'r') as f:
+        config = yaml.safe_load(f)
+    
+    # Get AMP flag from config, default to False if not specified
+    use_amp_from_config = config['training'].get('mixed_precision', False)
+    device_from_config = config['training'].get('device', 'cpu')
+
+
+    # Setup logging for the main training script
+    log_dir = Path('logs')
+    log_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    main_log_file = log_dir / f"main_training_script_{timestamp}.log"
+    
+    # Configure root logger for this script
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(main_log_file, mode='a', encoding='utf-8'),
+            logging.StreamHandler() # Also log to console
+        ]
+    )
+    logger = logging.getLogger(__name__) # Logger for this script
+    logger.info(f"Main training script logging started. Log file: {main_log_file}")
+    
+    if device_from_config == 'cuda':
+        logger.info(f"Configured to use Automatic Mixed Precision: {use_amp_from_config}")
+    else:
+        logger.info(f"Configured to use Automatic Mixed Precision: False (AMP is CUDA only or device is not CUDA)")
+
+
+    # Load data
+    logger.info(f"Loading data from {data_path}")
+    # ...existing code...
+
+    # Initialize trainer
+    trainer = EmotionTrainer(
+        model=model,
+        tokenizer=tokenizer, # Pass tokenizer if it exists
+        device=config['training']['device'],
+        learning_rate=config['training']['learning_rate'],
+        weight_decay=config['training']['weight_decay'],
+        warmup_steps=config['training']['warmup_steps'],
+        gradient_clipping=config['training']['gradient_clip_norm'],
+        save_dir=save_dir,
+        emotion_names=config['data']['emotion_names'],
+        class_weights=class_weights_tensor,
+        loss_type=config['training'].get('loss_type', 'cross_entropy'), # Default to cross_entropy
+        gamma=config['training'].get('focal_loss_gamma', 2.0), # Default gamma for focal loss
+        label_smoothing=config['training'].get('label_smoothing', 0.0) # Default label smoothing
+    )
+
+    # Train model
+    logger.info("Starting model training...")
+    trainer.train(
+        train_texts=train_texts,
+        train_labels=train_labels,
+        val_texts=val_texts,
+        val_labels=val_labels,
+        num_epochs=config['training']['num_epochs'],
+        batch_size=config['training']['batch_size'],
+        max_length=config['data']['max_length'],
+        use_enhanced_bilstm=use_enhanced_bilstm,
+        vocab_builder=vocab_builder if use_enhanced_bilstm else None,
+        vocab_save_path=vocab_save_path if use_enhanced_bilstm else None,
+        debug_predictions=debug_predictions,
+        use_amp=use_amp_from_config # Pass AMP flag from config
+    )
+def train_ensemble_from_config(config_path: str, data_path: str, save_dir: str, debug_predictions: bool = False): # Removed use_amp from signature
+    """
+    Train an ensemble model based on a YAML configuration file.
+
+    Args:
+        config_path: Path to the YAML configuration file for the ensemble.
+        data_path: Path to the CSV data file.
+        save_dir: Directory to save the trained ensemble model and logs.
+        debug_predictions: Whether to log debug predictions.
+    """
+    with open(config_path, 'r') as f:
+        config = yaml.safe_load(f)
+
+    # Get AMP flag from config, default to False if not specified
+    use_amp_from_config = config['training'].get('mixed_precision', False)
+    device_from_config = config['training'].get('device', 'cpu')
+
+    # Setup logging for the main training script
+    log_dir = Path('logs')
+    log_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    main_log_file = log_dir / f"ensemble_training_script_{timestamp}.log"
+    
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(main_log_file, mode='a', encoding='utf-8'),
+            logging.StreamHandler()
+        ]
+    )
+    logger = logging.getLogger(__name__)
+    logger.info(f"Ensemble training script logging started. Log file: {main_log_file}")
+    if device_from_config == 'cuda':
+        logger.info(f"Configured to use Automatic Mixed Precision: {use_amp_from_config}")
+    else:
+        logger.info(f"Configured to use Automatic Mixed Precision: False (AMP is CUDA only or device is not CUDA)")
+
+
+    # Load data
+    logger.info(f"Loading data from {data_path}")
+    # ...existing code...
+
+    # Initialize trainer
+    trainer = EmotionTrainer(
+        model=ensemble_model,
+        device=config['training']['device'],
+        learning_rate=config['training']['learning_rate'],
+        weight_decay=config['training']['weight_decay'],
+        warmup_steps=config['training']['warmup_steps'],
+        gradient_clipping=config['training']['gradient_clip_norm'],
+        save_dir=save_dir,
+        emotion_names=config['data']['emotion_names'],
+        class_weights=class_weights_tensor,
+        loss_type=config['training'].get('loss_type', 'cross_entropy'),
+        gamma=config['training'].get('focal_loss_gamma', 2.0),
+        label_smoothing=config['training'].get('label_smoothing', 0.0)
+    )
+
+    # Train ensemble model
+    logger.info("Starting ensemble model training...")
+    trainer.train(
+        train_texts=train_texts, 
+        train_labels=train_labels, 
+        val_texts=val_texts, 
+        val_labels=val_labels, 
+        num_epochs=config['training']['num_epochs'],
+        batch_size=config['training']['batch_size'], 
+        max_length=config['data']['max_length'], 
+        debug_predictions=debug_predictions,
+        use_amp=use_amp_from_config # Pass AMP flag from config
+    )
+
+if __name__ == '__main__':
+    import argparse
+    import yaml # Ensure yaml is imported
+
+    parser = argparse.ArgumentParser(description="Train an emotion recognition model.")
+    parser.add_argument('--config', type=str, required=True, help="Path to the YAML configuration file.")
+    parser.add_argument('--data_path', type=str, required=True, help="Path to the training data CSV file.")
+    parser.add_argument('--save_dir', type=str, default='models/saved_models', help="Directory to save trained models and logs.")
+    parser.add_argument('--ensemble', action='store_true', help="Train an ensemble model.")
+    parser.add_argument('--debug_predictions', action='store_true', help="Log debug predictions during training and validation.")
+    # Removed --use_amp argument, as it's now controlled by the config file's 'mixed_precision' flag.
+
+    args = parser.parse_args()
+
+    # Create save directory if it doesn't exist
+    Path(args.save_dir).mkdir(parents=True, exist_ok=True)
+
+    if args.ensemble:
+        # Pass debug_predictions; use_amp is now handled internally based on config
+        train_ensemble_from_config(args.config, args.data_path, args.save_dir, args.debug_predictions)
+    else:
+        # Pass debug_predictions; use_amp is now handled internally based on config
+        train_model_from_config(args.config, args.data_path, args.save_dir, args.debug_predictions)

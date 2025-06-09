@@ -5,12 +5,10 @@ model:
   models:
     - type: "distilbert"
       model_name: "distilbert-base-uncased"
-      weight: 0.4
-    - type: "twitter_roberta"
+      weight: 0.5 # Adjusted weight
+    - type: "twitter-roberta"
       model_name: "cardiffnlp/twitter-roberta-base-emotion"
-      weight: 0.4
-    - type: "bilstm"
-      weight: 0.2
+      weight: 0.5 # Adjusted weight
   
   num_classes: 6
   voting_strategy: "soft"  # Options: soft, hard
@@ -19,21 +17,25 @@ model:
 
 training:
   # Ensemble training strategy
-  strategy: "individual"  # Options: individual, joint
+  strategy: "joint"  # Changed to joint for potentially faster/better optimization
   
-  # Individual model training
+  # Individual model training (paths for individual models if strategy were "individual")
   individual_configs:
     - "configs/distilbert_config.yaml"
     - "configs/twitter_roberta_config.yaml"
-    - "configs/bilstm_config.yaml"
   
   # Joint training (if strategy is "joint")
-  batch_size: 16
-  learning_rate: 1e-5
+  batch_size: 32 # Potentially increase if memory allows
+  learning_rate: 2e-5 # Adjusted, common for transformers
   num_epochs: 5
   warmup_steps: 200
   weight_decay: 0.01
   gradient_clip_norm: 1.0
+  mixed_precision: true # Ensure this is true for AMP
+  device: "auto" # Auto-detect device or specify "cpu" or "cuda"
+  loss_type: "cross_entropy" # or focal
+  # focal_loss_gamma: 2.0 # if loss_type is focal
+  # label_smoothing: 0.0 # if needed
 
 data:
   max_length: 128
@@ -45,7 +47,7 @@ data:
   
   # Data loading
   batch_sizes:
-    train: 16
+    train: 32 # Ensure this matches training.batch_size
     validation: 32
     test: 32
   
@@ -54,7 +56,7 @@ data:
     validation: false
     test: false
   
-  num_workers: 0
+  num_workers: 4 # Ensure this is set, was 0 in attachment
 
 preprocessing:
   # Use preprocessing optimized for each model

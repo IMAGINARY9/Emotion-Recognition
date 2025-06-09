@@ -1,7 +1,7 @@
 # Configuration for Twitter RoBERTa-based emotion recognition model
 
 model:
-  type: "twitter_roberta"
+  type: "twitter-roberta"
   model_name: "cardiffnlp/twitter-roberta-base-emotion"
   num_classes: 6
   dropout_rate: 0.2

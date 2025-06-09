@@ -1,3 +1,10 @@
+import sys
+import os
+# Ensure src is in sys.path for direct script execution
+SRC_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'src'))
+if SRC_PATH not in sys.path:
+    sys.path.insert(0, SRC_PATH)
+
 import inspect
 import json
 from pathlib import Path
@@ -5,6 +12,42 @@ import torch
 from transformers import AutoTokenizer
 from src.config import ConfigManager
 from src.models import create_model, BiLSTMEmotionModel, DistilBERTEmotionModel, TwitterRoBERTaEmotionModel
+
+def get_default_tokenizer_path(model_type: str) -> str:
+    """Get default tokenizer path for a model type."""
+    tokenizer_defaults = {
+        'distilbert': 'distilbert-base-uncased',
+        'twitter-roberta': 'cardiffnlp/twitter-roberta-base-emotion',
+        'twitter_roberta': 'cardiffnlp/twitter-roberta-base-emotion',
+        'roberta': 'cardiffnlp/twitter-roberta-base-emotion'
+    }
+    return tokenizer_defaults.get(model_type.replace('_', '-'), None)
+
+def load_tokenizer_for_model(model_type: str, model_path: Path = None) -> AutoTokenizer:
+    """
+    Load tokenizer for a specific model type.
+    
+    Args:
+        model_type: Type of model ('distilbert', 'twitter-roberta', etc.)
+        model_path: Optional path to saved tokenizer directory
+        
+    Returns:
+        Loaded tokenizer
+    """
+    model_type = model_type.replace('_', '-')
+    
+    # Try to load from saved tokenizer directory first
+    if model_path:
+        tokenizer_dir = model_path / f'{model_type}_best_model_tokenizer'
+        if tokenizer_dir.exists():
+            return AutoTokenizer.from_pretrained(str(tokenizer_dir))
+    
+    # Fall back to default pretrained tokenizer
+    default_path = get_default_tokenizer_path(model_type)
+    if default_path:
+        return AutoTokenizer.from_pretrained(default_path)
+    
+    raise ValueError(f"No tokenizer available for model type: {model_type}")
 
 def filter_model_config(model_class, config_dict):
     """Return a config dict with only keys accepted by the model_class __init__."""
@@ -51,14 +94,12 @@ def load_model_and_assets(model_path: str, config_path: str = None):
             weight = sub_cfg.pop('weight', 1.0/len(config.model.models))
             weights.append(weight)
             sub_type = sub_cfg.pop('type').replace('_', '-')
-            model_class = model_class_map.get(sub_type)
+            model_class = model_class_map.get(sub_type)            
             # Tokenizer
             if sub_type == 'distilbert':
-                tokenizer_dir = model_path / 'distilbert_best_model_tokenizer'
-                tokenizers['distilbert'] = AutoTokenizer.from_pretrained(str(tokenizer_dir)) if tokenizer_dir.exists() else AutoTokenizer.from_pretrained('distilbert-base-uncased')
+                tokenizers['distilbert'] = load_tokenizer_for_model('distilbert', model_path)
             elif sub_type == 'twitter-roberta':
-                tokenizer_dir = model_path / 'twitter-roberta_best_model_tokenizer'
-                tokenizers['twitter-roberta'] = AutoTokenizer.from_pretrained(str(tokenizer_dir)) if tokenizer_dir.exists() else AutoTokenizer.from_pretrained('cardiffnlp/twitter-roberta-base-emotion')
+                tokenizers['twitter-roberta'] = load_tokenizer_for_model('twitter-roberta', model_path)
             # Vocab
             if sub_type == 'bilstm':
                 vocab_path = model_path / 'bilstm_vocab.json'
@@ -93,16 +134,13 @@ def load_model_and_assets(model_path: str, config_path: str = None):
         model = create_model(model_type='ensemble', model_config={'models': submodels, 'weights': weights[:len(submodels)]})
         return model, config, tokenizers, vocabs
     # --- Single model ---
-    else:
+    else:        
         model_class = model_class_map.get(model_type)
+        vocab = None  # Ensure vocab is always defined
         if model_type == 'distilbert':
-            tokenizer_dir = model_path / 'distilbert_best_model_tokenizer'
-            tokenizer = AutoTokenizer.from_pretrained(str(tokenizer_dir)) if tokenizer_dir.exists() else AutoTokenizer.from_pretrained('distilbert-base-uncased')
-            tokenizers['distilbert'] = tokenizer
+            tokenizers['distilbert'] = load_tokenizer_for_model('distilbert', model_path)
         elif model_type == 'twitter-roberta':
-            tokenizer_dir = model_path / 'twitter-roberta_best_model_tokenizer'
-            tokenizer = AutoTokenizer.from_pretrained(str(tokenizer_dir)) if tokenizer_dir.exists() else AutoTokenizer.from_pretrained('cardiffnlp/twitter-roberta-base-emotion')
-            tokenizers['twitter-roberta'] = tokenizer
+            tokenizers['twitter-roberta'] = load_tokenizer_for_model('twitter-roberta', model_path)
         elif model_type == 'bilstm':
             # Always load vocab from model_path/bilstm_vocab.json
             vocab_path = model_path / 'bilstm_vocab.json'

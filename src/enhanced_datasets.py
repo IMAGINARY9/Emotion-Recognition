@@ -6,7 +6,7 @@ import torch
 from torch.utils.data import Dataset
 from typing import List, Dict, Optional, Tuple
 import numpy as np
-from vocab_utils import BiLSTMVocabularyBuilder
+from utils.vocab_utils import BiLSTMVocabularyBuilder
 
 
 class EnhancedBiLSTMDataset(Dataset):

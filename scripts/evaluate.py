@@ -25,11 +25,12 @@ from transformers import AutoTokenizer
 sys.path.append(str(Path(__file__).parent.parent / "src"))
 
 from src.config import ConfigManager, get_device_config
-from src.data_utils import EmotionDataLoader
+from utils.data_utils import EmotionDataLoader
 from src.preprocessing import EmotionPreprocessor, EmotionDataProcessor
 from src.models import create_model, EmotionDataset
 from src.evaluation import EmotionEvaluator
 from utils.model_loading import load_model_and_assets, filter_model_config
+from utils.training_utils import create_datasets
 
 logger = logging.getLogger(__name__)
 
@@ -78,92 +79,6 @@ def load_test_data(config, data_path: str = None, use_validation: bool = False):
             logger.info(f"Loaded test data from: {raw_file}")
             return data_loader, df
     raise FileNotFoundError("No test/validation data found. Please specify --data-path or ensure data/splits or data/raw contains a CSV.")
-
-def create_test_dataset(config, data_loader, test_df):
-    """Create test dataset(s) for all models in the config."""
-    # If ensemble, use JointEnsembleDataset and joint collate
-    if hasattr(config.model, 'type') and config.model.type == 'ensemble':
-        from src.models import JointEnsembleDataset, get_joint_ensemble_collate_fn
-        test_texts = test_df[config.data.text_column].astype(str).tolist()
-        test_labels = data_loader.label_encoder.transform(test_df[config.data.label_column].tolist())
-        test_dataset = JointEnsembleDataset(test_texts, test_labels)
-        # Build tokenizers for joint collate
-        from transformers import AutoTokenizer
-        tokenizers = {
-            'distilbert': AutoTokenizer.from_pretrained('distilbert-base-uncased'),
-            'twitter-roberta': AutoTokenizer.from_pretrained('cardiffnlp/twitter-roberta-base-emotion')
-        }
-        # Check for BiLSTM vocab
-        import os
-        vocab = None
-        for m in config.model.models:
-            if m['type'] == 'bilstm':
-                vocab_path = Path(config.paths.model_dir) / 'bilstm_vocab.json'
-                if vocab_path.exists():
-                    with open(vocab_path, 'r', encoding='utf-8') as f:
-                        vocab = json.load(f)
-                break
-        collate_fn = get_joint_ensemble_collate_fn(tokenizers, max_length=getattr(config.data, 'max_length', 128), vocab=vocab)
-        return test_dataset, collate_fn
-    model_types = [m['type'] for m in config.model.models] if hasattr(config.model, 'models') else [config.model.type]
-    tokenizers, vocabs = {}, {}
-    from transformers import AutoTokenizer
-    for mtype in model_types:
-        if mtype == 'distilbert':
-            tokenizers['distilbert'] = AutoTokenizer.from_pretrained('distilbert-base-uncased')
-        elif mtype == 'twitter-roberta':
-            tokenizers['twitter-roberta'] = AutoTokenizer.from_pretrained('cardiffnlp/twitter-roberta-base-emotion')
-        elif mtype == 'bilstm':
-            vocab_path = Path(config.paths.model_dir) / 'bilstm_vocab.json'
-            if vocab_path.exists():
-                with open(vocab_path, 'r', encoding='utf-8') as f:
-                    vocabs['bilstm'] = json.load(f)
-            else:
-                vocabs['bilstm'] = None
-    preprocessor = EmotionPreprocessor(
-        normalize_case=getattr(config.preprocessing, 'lowercase', True),
-        handle_emojis=getattr(config.preprocessing, 'emoji_handling', 'convert'),
-        expand_contractions=getattr(config.preprocessing, 'expand_contractions', True),
-        remove_stopwords=getattr(config.preprocessing, 'remove_stopwords', False),
-        lemmatize=getattr(config.preprocessing, 'lemmatize', False),
-        handle_social_media=getattr(config.preprocessing, 'handle_social_media', True),
-        min_length=getattr(config.preprocessing, 'min_length', 3),
-        max_length=getattr(config.data, 'max_length', 128)
-    )
-    data_processor = EmotionDataProcessor(preprocessor=preprocessor)
-    processed_test = data_processor.preprocessor.preprocess_dataset(
-        test_df, config.data.text_column, config.data.label_column
-    )
-    test_texts, test_labels = data_processor.prepare_for_training(
-        processed_test, text_column='clean_text', label_column=config.data.label_column
-    )
-    test_labels = data_loader.label_encoder.transform(test_labels)
-    datasets = {}
-    if 'distilbert' in model_types:
-        datasets['distilbert'] = EmotionDataset(
-            texts=test_texts,
-            labels=test_labels,
-            tokenizer=tokenizers['distilbert'],
-            max_length=getattr(config.data, 'max_length', 128)
-        )
-    if 'twitter-roberta' in model_types:
-        datasets['twitter-roberta'] = EmotionDataset(
-            texts=test_texts,
-            labels=test_labels,
-            tokenizer=tokenizers['twitter-roberta'],
-            max_length=getattr(config.data, 'max_length', 128)
-        )
-    if 'bilstm' in model_types:
-        datasets['bilstm'] = EmotionDataset(
-            texts=test_texts,
-            labels=test_labels,
-            tokenizer=None,
-            max_length=getattr(config.data, 'max_length', 128),
-            vocab=vocabs['bilstm']
-        )
-    if len(datasets) == 1:
-        return list(datasets.values())[0], None
-    return datasets, None
 
 def run_evaluation(model, config, test_dataset, device: str, output_dir: str, args, collate_fn=None):
     """Run comprehensive evaluation."""
@@ -234,7 +149,8 @@ def main():
         model = model.to(device)
         logger.info(f"Using device: {device}")
         data_loader, test_df = load_test_data(config, args.data_path, args.use_validation)
-        test_dataset, collate_fn = create_test_dataset(config, data_loader, test_df)
+        datasets, data_processor, vocab, *rest = create_datasets(config, data_loader, None, None, test_df, )
+        test_dataset = datasets['test']
         # --- Set output directory to reports/<model_dir_name>/ ---
         from pathlib import Path
         model_path = Path(args.model_path)

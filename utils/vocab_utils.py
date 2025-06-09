@@ -13,7 +13,43 @@ from typing import List, Dict, Tuple, Optional, Set
 from pathlib import Path
 import pandas as pd
 import numpy as np
-from preprocessing import EmotionPreprocessor
+from src.preprocessing import EmotionPreprocessor
+
+def build_bilstm_vocab_and_tokenizer(train_texts: List[str], save_path: str = None) -> Tuple[Dict, callable]:
+    """
+    Build BiLSTM vocabulary and tokenizer function from training texts.
+    
+    Args:
+        train_texts: List of training text samples
+        save_path: Optional path to save vocabulary JSON file
+        
+    Returns:
+        Tuple of (vocabulary_dict, tokenizer_function)
+    """
+    from collections import Counter
+    import json
+    from pathlib import Path
+    
+    # Tokenize and count words
+    tokens = [word for text in train_texts for word in text.split()]
+    vocab_counter = Counter(tokens)
+    
+    # Build vocabulary: +2 for PAD/UNK special tokens
+    vocab = {word: idx+2 for idx, (word, _) in enumerate(vocab_counter.most_common())}
+    vocab['<PAD>'] = 0
+    vocab['<UNK>'] = 1
+    
+    # Create tokenizer function
+    def bilstm_tokenizer_fn(text):
+        return [vocab.get(tok, vocab.get('<UNK>', 1)) for tok in text.split()]
+    
+    # Save vocabulary if path provided
+    if save_path:
+        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+        with open(save_path, "w", encoding="utf-8") as f:
+            json.dump(vocab, f)
+    
+    return vocab, bilstm_tokenizer_fn
 
 class BiLSTMVocabularyBuilder:
     """

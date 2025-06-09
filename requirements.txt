@@ -53,4 +53,9 @@ pytest>=7.3.0
 pytest-cov>=4.1.0
 
 # CUDA support (optional)
-# torch-audio>=2.0.0  # Uncomment if audio processing needed
+# Uncomment if using GPU
+# torch>=2.6.0+cu121  # Adjust version based on your CUDA version
+# torchvision>=0.15.0  # Uncomment if using image data
+# torchaudio>=0.15.0  # Uncomment if using audio data
+
+# tensorflow[and-cuda]>=2.13.0  # Uncomment if using TensorFlow models 

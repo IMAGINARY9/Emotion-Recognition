@@ -16,7 +16,7 @@ from datetime import datetime
 sys.path.append(str(Path(__file__).parent.parent / "src"))
 
 from src.config import ConfigManager, setup_logging, get_device_config
-from src.data_utils import EmotionDataLoader, setup_data_directories, download_sample_data
+from utils.data_utils import EmotionDataLoader, setup_data_directories, download_sample_data
 from src.preprocessing import EmotionPreprocessor, EmotionDataProcessor
 from src.models import create_model, calibrate_ensemble_weights, get_joint_ensemble_collate_fn
 
@@ -87,38 +87,12 @@ def main():
         config.logging.level = "DEBUG"
     setup_logging(config)
     device = get_device_config(config)
-    logger.info(f"Using device: {device}")
+    logger.info(f"Using device: {device}")    
     output_dir = Path(args.output_dir)
+    
     # --- Data Preparation ---
-    data_loader, train_df, val_df, test_df = EmotionDataLoader(config.paths.data_dir), None, None, None
-    data_loader, train_df, val_df, test_df = EmotionDataLoader(config.paths.data_dir), None, None, None
-    data_loader, train_df, val_df, test_df = EmotionDataLoader(config.paths.data_dir), None, None, None
-    data_loader, train_df, val_df, test_df = EmotionDataLoader(config.paths.data_dir), None, None, None
-    data_loader, train_df, val_df, test_df = EmotionDataLoader(config.paths.data_dir), None, None, None
-    data_loader, train_df, val_df, test_df = EmotionDataLoader(config.paths.data_dir), None, None, None
-    data_loader, train_df, val_df, test_df = EmotionDataLoader(config.paths.data_dir), None, None, None
-    data_loader, train_df, val_df, test_df = EmotionDataLoader(config.paths.data_dir), None, None, None
-    data_loader, train_df, val_df, test_df = EmotionDataLoader(config.paths.data_dir), None, None, None
-    data_loader, train_df, val_df, test_df = EmotionDataLoader(config.paths.data_dir), None, None, None
-    data_loader, train_df, val_df, test_df = EmotionDataLoader(config.paths.data_dir), None, None, None
-    data_loader, train_df, val_df, test_df = EmotionDataLoader(config.paths.data_dir), None, None, None
-    data_loader, train_df, val_df, test_df = EmotionDataLoader(config.paths.data_dir), None, None, None
-    data_loader, train_df, val_df, test_df = EmotionDataLoader(config.paths.data_dir), None, None, None
-    data_loader, train_df, val_df, test_df = EmotionDataLoader(config.paths.data_dir), None, None, None
-    data_loader, train_df, val_df, test_df = EmotionDataLoader(config.paths.data_dir), None, None, None
-    data_loader, train_df, val_df, test_df = EmotionDataLoader(config.paths.data_dir), None, None, None
-    data_loader, train_df, val_df, test_df = EmotionDataLoader(config.paths.data_dir), None, None, None
-    data_loader, train_df, val_df, test_df = EmotionDataLoader(config.paths.data_dir), None, None, None
-    # Actually load and prepare data
-    data_loader, train_df, val_df, test_df = EmotionDataLoader(config.paths.data_dir), None, None, None
-    data_loader, train_df, val_df, test_df = EmotionDataLoader(config.paths.data_dir), None, None, None
-    data_loader, train_df, val_df, test_df = EmotionDataLoader(config.paths.data_dir), None, None, None
-    data_loader, train_df, val_df, test_df = EmotionDataLoader(config.paths.data_dir), None, None, None
-    data_loader, train_df, val_df, test_df = EmotionDataLoader(config.paths.data_dir), None, None, None
-    data_loader, train_df, val_df, test_df = EmotionDataLoader(config.paths.data_dir), None, None, None
-    data_loader, train_df, val_df, test_df = EmotionDataLoader(config.paths.data_dir), None, None, None
-    data_loader, train_df, val_df, test_df = EmotionDataLoader(config.paths.data_dir), None, None, None
-    data_loader, train_df, val_df, test_df = EmotionDataLoader(config.paths.data_dir), None, None, None
+    data_loader = EmotionDataLoader(config.paths.data_dir)
+    
     # Use the same logic as in train.py to load and preprocess data
     from src.preprocessing import EmotionPreprocessor, EmotionDataProcessor
     from src.models import JointEnsembleDataset
@@ -144,17 +118,13 @@ def main():
     processed_train, processed_val, processed_test = data_processor.process_emotion_dataset(
         train_df, val_df, test_df, text_column=config.data.text_column, label_column=config.data.label_column
     )
-    # Build vocab if needed
+    # Build vocab if needed    
     use_bilstm = any(m['type'] == 'bilstm' for m in config_dict['model']['models'])
     vocab = None
     if use_bilstm:
-        from collections import Counter
+        from utils.vocab_utils import build_bilstm_vocab_and_tokenizer
         train_texts = processed_train['clean_text'].tolist() if not processed_train.empty else []
-        tokens = [word for text in train_texts for word in text.split()]
-        vocab_counter = Counter(tokens)
-        vocab = {word: idx+2 for idx, (word, _) in enumerate(vocab_counter.most_common())}
-        vocab['<PAD>'] = 0
-        vocab['<UNK>'] = 1
+        vocab, _ = build_bilstm_vocab_and_tokenizer(train_texts)
     # Prepare validation dataset
     label_encoder = data_loader.label_encoder
     val_texts, val_labels = data_processor.prepare_for_training(
@@ -163,13 +133,13 @@ def main():
     val_labels = label_encoder.transform(val_labels)
     val_dataset = JointEnsembleDataset(val_texts, val_labels)
     # Build collate_fn for joint ensemble if needed
-    from torch.utils.data import DataLoader
+    from torch.utils.data import DataLoader    
     strategy = config_dict.get('training', {}).get('strategy', None)
     if strategy == 'joint':
-        from transformers import AutoTokenizer
+        from utils.model_loading import load_tokenizer_for_model
         tokenizers = {
-            'distilbert': AutoTokenizer.from_pretrained('distilbert-base-uncased'),
-            'twitter-roberta': AutoTokenizer.from_pretrained('cardiffnlp/twitter-roberta-base-emotion')
+            'distilbert': load_tokenizer_for_model('distilbert'),
+            'twitter-roberta': load_tokenizer_for_model('twitter-roberta')
         }
         if vocab is not None:
             tokenizers['bilstm'] = None
