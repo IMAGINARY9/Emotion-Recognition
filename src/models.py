@@ -530,21 +530,26 @@ class EnsembleEmotionModel(nn.Module):
         return str(idx_tensor)
 
     def forward(self, debug_predictions: bool = False, **inputs) -> Dict[str, torch.Tensor]:
-        """Forward pass through ensemble.
-        Args:
-            debug_predictions: If True, print [Ensemble Debug] prediction/logit info for each model and ensemble output.
-        """
         logits_list = []
         successful_indices = []
-        # Only lowercase top-level keys, do NOT replace underscores with dashes
-        normalized_inputs = {k.lower(): v for k, v in inputs.items()}
+        # Normalize keys: allow both hyphen and underscore variants
+        normalized_inputs = {}
+        for k, v in inputs.items():
+            normalized_inputs[k] = v
+            if '-' in k:
+                normalized_inputs[k.replace('-', '_')] = v
+            if '_' in k:
+                normalized_inputs[k.replace('_', '-')]= v
+        # DEBUG: Print submodel names and input keys
+        print(f"[Ensemble Debug] Submodel names: {[type(m).__name__ for m in self.models]}")
+        print(f"[Ensemble Debug] Input keys: {list(inputs.keys())}")
         for i, model in enumerate(self.models):
             try:
                 model_name = type(model).__name__.lower().replace('_', '-')
                 # Map model_name to input key
                 if 'distilbert' in model_name:
                     key = 'distilbert'
-                elif 'roberta' in model_name or 'twitterroberta' in model_name or 'twitter-roberta' in model_name:
+                elif 'roberta' in model_name or 'twitterroberta' in model_name or 'twitter-roberta' in model_name or 'twitter_roberta' in model_name:
                     key = 'twitter-roberta'
                 elif 'bilstm' in model_name:
                     key = 'bilstm'
@@ -1047,6 +1052,7 @@ def get_joint_ensemble_collate_fn(tokenizers, max_length=128, vocab=None):
     vocab: for bilstm, a vocab dict.
     """
     def collate_fn(batch):
+        import torch
         texts = [item['text'] for item in batch]
         labels = torch.tensor([item['label'] for item in batch], dtype=torch.long)
         batch_dict = {'labels': labels}
@@ -1079,3 +1085,19 @@ def get_joint_ensemble_collate_fn(tokenizers, max_length=128, vocab=None):
             batch_dict['bilstm'] = None
         return batch_dict
     return collate_fn
+
+def prepare_ensemble_batches(texts, tokenizers, max_length=128, vocab=None, batch_size=32):
+    """
+    Prepares batches for ensemble models using the joint collate function.
+    Returns a list of batch dicts ready for prediction/evaluation.
+    """
+    from torch.utils.data import DataLoader
+    dataset = JointEnsembleDataset(texts, [0]*len(texts))  # Dummy labels for prediction
+    collate_fn = get_joint_ensemble_collate_fn(tokenizers, max_length=max_length, vocab=vocab)
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
+    batches = []
+    for batch in loader:
+        # Remove 'labels' for prediction
+        batch = {k: v for k, v in batch.items() if k != 'labels'}
+        batches.append(batch)
+    return batches

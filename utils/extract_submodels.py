@@ -26,7 +26,15 @@ def extract_and_save_submodels(ensemble_model, output_dir):
         raise ValueError("Provided model is not an ensemble or does not have submodels.")
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    # Mapping from class name to expected file prefix
+    class_to_prefix = {
+        'DistilBERTEmotionModel': 'distilbert',
+        'TwitterRoBERTaEmotionModel': 'twitter-roberta',
+        'BiLSTMEmotionModel': 'bilstm',
+    }
     for idx, submodel in enumerate(ensemble_model.models):
-        submodel_path = output_dir / f"submodel_{idx}_{type(submodel).__name__}.pt"
+        class_name = type(submodel).__name__
+        prefix = class_to_prefix.get(class_name, f'submodel_{idx}')
+        submodel_path = output_dir / f"{prefix}_best_model.pt"
         torch.save(submodel.state_dict(), submodel_path)
-        print(f"Saved submodel {idx} to {submodel_path}")
+        print(f"Saved submodel {idx} ({class_name}) to {submodel_path}")

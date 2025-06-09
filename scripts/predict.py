@@ -25,7 +25,7 @@ sys.path.append(str(Path(__file__).parent.parent / "src"))
 
 from src.config import ConfigManager, setup_logging, get_device_config
 from src.preprocessing import EmotionPreprocessor
-from src.models import create_model, EmotionPredictor
+from src.models import create_model, EmotionPredictor, prepare_ensemble_batches, move_to_device
 from utils.model_loading import load_model_and_assets, filter_model_config
 from src.visualization import plot_word_importances, plot_ensemble_votes, plot_confidence_progression
 from utils.training_utils import create_datasets
@@ -89,7 +89,6 @@ def make_predictions(model, config, texts, device, args, tokenizers=None, vocabs
         if hasattr(preproc_section, k):
             preproc_kwargs[k] = getattr(preproc_section, k)
     preprocessor = EmotionPreprocessor(**preproc_kwargs)
-    # --- Do NOT pass vocab to EmotionPredictor; vocab is attached to the model if needed ---
     predictor_kwargs = dict(
         model=model,
         tokenizer=tokenizers.get('distilbert') or tokenizers.get('twitter-roberta') if tokenizers else None,
@@ -98,6 +97,48 @@ def make_predictions(model, config, texts, device, args, tokenizers=None, vocabs
         device=device
     )
     predictor = EmotionPredictor(**predictor_kwargs)
+
+    is_ensemble = hasattr(config.model, 'type') and config.model.type == 'ensemble'
+    batch_size = args.batch_size if hasattr(args, 'batch_size') else 32
+    max_length = getattr(config, 'max_length', 128)
+    results = []
+
+    if is_ensemble:
+        # Always use ensemble batch preparation, even for single text
+        batches = prepare_ensemble_batches(
+            texts,
+            tokenizers=tokenizers,
+            max_length=max_length,
+            vocab=vocabs.get('bilstm') if vocabs else None,
+            batch_size=batch_size
+        )
+        for batch in batches:
+            # Move all tensors in batch to the correct device
+            batch = move_to_device(batch, device)
+            # Normalize keys: add both hyphen and underscore versions for compatibility
+            keys_to_add = {}
+            for k in list(batch.keys()):
+                if '-' in k:
+                    keys_to_add[k.replace('-', '_')] = batch[k]
+                if '_' in k:
+                    keys_to_add[k.replace('_', '-')] = batch[k]
+            batch.update(keys_to_add)
+            logger.debug(f"Batch keys: {list(batch.keys())}")
+            for k, v in batch.items():
+                logger.debug(f"  {k}: type={type(v)}, value={(v.keys() if isinstance(v, dict) else v)}")
+            if all(v is None for v in batch.values()):
+                logger.error(f"All submodel inputs are None! Tokenizers: {tokenizers}")
+            with torch.no_grad():
+                logits = model(**batch)['logits']
+                probs = torch.softmax(logits, dim=1)
+                preds = torch.argmax(probs, dim=1)
+                for i in range(len(preds)):
+                    results.append({
+                        'emotion': config.emotions[preds[i].item()] if hasattr(config, 'emotions') else preds[i].item(),
+                        'probabilities': {config.emotions[j]: probs[i, j].item() for j in range(probs.shape[1])} if hasattr(config, 'emotions') else probs[i].tolist()
+                    })
+        return results
+
     logger.info(f"Making predictions on {len(texts)} texts...")
 
     # --- Adaptive top-k logic ---

@@ -111,23 +111,23 @@ python scripts/train.py --config distilbert --data-path data/emotions.csv --epoc
 
 ```bash
 # Single text prediction
-python scripts/predict.py -m outputs/my_first_model -t "I love this amazing day!"
+python scripts/predict.py -m models/my_first_model -t "I love this amazing day!"
 
 # Batch prediction from file
-python scripts/predict.py -m outputs/my_first_model --text-file input_texts.txt -o predictions.json
+python scripts/predict.py -m models/my_first_model --text-file input_texts.txt -o predictions.json
 
 # CSV file prediction
-python scripts/predict.py -m outputs/my_first_model --csv-file data.csv --text-column "text" -o results.csv
+python scripts/predict.py -m models/my_first_model --csv-file data.csv --text-column "text" -o results.csv
 ```
 
 ### 3. Evaluate Model
 
 ```bash
 # Evaluate on test set
-python scripts/evaluate.py -m outputs/my_first_model --output-dir evaluation_results
+python scripts/evaluate.py -m models/my_first_model --output-dir evaluation_results
 
 # Evaluate with error analysis
-python scripts/evaluate.py -m outputs/my_first_model --error-analysis --save-predictions
+python scripts/evaluate.py -m models/my_first_model --error-analysis --save-predictions
 ```
 
 ## Model Types
