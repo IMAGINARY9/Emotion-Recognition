@@ -540,9 +540,6 @@ class EnsembleEmotionModel(nn.Module):
                 normalized_inputs[k.replace('-', '_')] = v
             if '_' in k:
                 normalized_inputs[k.replace('_', '-')]= v
-        # DEBUG: Print submodel names and input keys
-        print(f"[Ensemble Debug] Submodel names: {[type(m).__name__ for m in self.models]}")
-        print(f"[Ensemble Debug] Input keys: {list(inputs.keys())}")
         for i, model in enumerate(self.models):
             try:
                 model_name = type(model).__name__.lower().replace('_', '-')

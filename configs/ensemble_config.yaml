@@ -2,14 +2,13 @@
 
 model:
   type: "ensemble"
-  models:
-    - type: "distilbert"
-      model_name: "distilbert-base-uncased"
-      weight: 0.5 # Adjusted weight
-    - type: "twitter-roberta"
-      model_name: "cardiffnlp/twitter-roberta-base-emotion"
-      weight: 0.5 # Adjusted weight
-  
+  models:    
+  - type: "distilbert"
+    model_name: "distilbert-base-uncased"
+    weight: 0.5
+  - type: "twitter-roberta"
+    model_name: "cardiffnlp/twitter-roberta-base-emotion"
+    weight: 0.5
   num_classes: 6
   voting_strategy: "soft"  # Options: soft, hard
   dropout_rate: 0.3

@@ -112,10 +112,9 @@ def make_predictions(model, config, texts, device, args, tokenizers=None, vocabs
             vocab=vocabs.get('bilstm') if vocabs else None,
             batch_size=batch_size
         )
-        for batch in batches:
-            # Move all tensors in batch to the correct device
+        text_offset = 0
+        for batch_idx, batch in enumerate(batches):
             batch = move_to_device(batch, device)
-            # Normalize keys: add both hyphen and underscore versions for compatibility
             keys_to_add = {}
             for k in list(batch.keys()):
                 if '-' in k:
@@ -128,15 +127,67 @@ def make_predictions(model, config, texts, device, args, tokenizers=None, vocabs
                 logger.debug(f"  {k}: type={type(v)}, value={(v.keys() if isinstance(v, dict) else v)}")
             if all(v is None for v in batch.values()):
                 logger.error(f"All submodel inputs are None! Tokenizers: {tokenizers}")
-            with torch.no_grad():
-                logits = model(**batch)['logits']
-                probs = torch.softmax(logits, dim=1)
-                preds = torch.argmax(probs, dim=1)
-                for i in range(len(preds)):
-                    results.append({
-                        'emotion': config.emotions[preds[i].item()] if hasattr(config, 'emotions') else preds[i].item(),
-                        'probabilities': {config.emotions[j]: probs[i, j].item() for j in range(probs.shape[1])} if hasattr(config, 'emotions') else probs[i].tolist()
-                    })
+            # For each text in the batch, use predictor.predict to get full explanation dict
+            batch_texts = texts[text_offset:text_offset + batch_size]
+            for i, text in enumerate(batch_texts):
+                pred = predictor.predict([text], return_probabilities=True, debug_predictions=args.debug_predictions)[0]
+                if args.visualize:
+                    try:
+                        from pathlib import Path
+                        model_path = Path(args.model_path)
+                        model_dir_name = model_path.parent.name if model_path.is_file() else model_path.name
+                        vis_dir = Path('visualizations') / model_dir_name
+                        vis_dir.mkdir(parents=True, exist_ok=True)
+                        saved_files = []
+                        plot_types = []
+                        submodel_probs = None
+                        if 'ensemble_submodel_explanations' in pred and pred['ensemble_submodel_explanations']:
+                            submodel_probs = {
+                                submodel: sub_expl['probabilities']
+                                for submodel, sub_expl in pred['ensemble_submodel_explanations'].items()
+                                if 'probabilities' in sub_expl
+                            }
+                        if 'ensemble_votes' in pred and pred['ensemble_votes']:
+                            fname = plot_ensemble_votes(pred['ensemble_votes'], text, vis_dir, idx=text_offset + i, submodel_probs=submodel_probs)
+                            saved_files.append(fname)
+                            plot_types.append('ensemble_votes')
+                        if 'ensemble_submodel_explanations' in pred and pred['ensemble_submodel_explanations']:
+                            for submodel_name, sub_expl in pred['ensemble_submodel_explanations'].items():
+                                wi = sub_expl.get('word_importances')
+                                if wi and len(set(wi['importances'])) > 1:
+                                    fname = plot_word_importances(wi['words'], wi['importances'], text, vis_dir, idx=f"{text_offset + i}_{submodel_name}")
+                                    saved_files.append(fname)
+                                    plot_types.append(f'submodel_word_importances_{submodel_name}')
+                                cp = sub_expl.get('confidence_progression')
+                                if cp and 'tokens' in cp and 'confidences' in cp and len(cp['tokens']) == len(cp['confidences']):
+                                    fname = plot_confidence_progression(cp['tokens'], cp['confidences'], text, vis_dir, idx=f"{text_offset + i}_{submodel_name}")
+                                    saved_files.append(fname)
+                                    plot_types.append(f'submodel_confidence_progression_{submodel_name}')
+                        wi = pred.get('word_importances')
+                        if wi and len(set(wi['importances'])) > 1:
+                            fname = plot_word_importances(wi['words'], wi['importances'], text, vis_dir, idx=text_offset + i)
+                            saved_files.append(fname)
+                            plot_types.append('main_word_importances')
+                        cp = pred.get('confidence_progression')
+                        if cp and 'tokens' in cp and 'confidences' in cp and len(cp['tokens']) == len(cp['confidences']):
+                            fname = plot_confidence_progression(cp['tokens'], cp['confidences'], text, vis_dir, idx=text_offset + i)
+                            saved_files.append(fname)
+                            plot_types.append('main_confidence_progression')
+                        if not saved_files:
+                            summary_path = vis_dir / f'prediction_{text_offset + i}_summary.txt'
+                            with open(summary_path, 'w', encoding='utf-8') as f:
+                                f.write(f"Text: {text}\n")
+                                f.write(f"Predicted emotion: {pred.get('emotion')}\n")
+                            saved_files.append(str(summary_path))
+                            print(f"No plot generated for prediction {text_offset + i}, summary saved:")
+                        else:
+                            print(f"Plots generated for prediction {text_offset + i}: {', '.join(plot_types)}")
+                        for fname in saved_files:
+                            print(f"[Visualization saved] {fname}")
+                    except Exception as ve:
+                        logger.warning(f"Visualization failed: {ve}")
+                results.append(pred)
+            text_offset += batch_size
         return results
 
     logger.info(f"Making predictions on {len(texts)} texts...")

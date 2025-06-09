@@ -3,20 +3,18 @@
 model:
   type: "twitter-roberta"
   model_name: "cardiffnlp/twitter-roberta-base-emotion"
-  num_classes: 6
-  dropout_rate: 0.2
+  num_classes: 6  dropout_rate: 0.3
   max_length: 128
   freeze_base: false
-  
-training:
-  batch_size: 16  # Smaller batch size for larger model
-  learning_rate: 1e-5  # Lower learning rate for pre-trained model
+
+training:  
+  batch_size: 32
+  learning_rate: 2e-5
   num_epochs: 8
   warmup_steps: 300
   weight_decay: 0.01
   gradient_clip_norm: 1.0
-  accumulation_steps: 2  # Gradient accumulation
-  
+  accumulation_steps: 2
   # Learning rate scheduler
   scheduler:
     type: "linear"
@@ -24,8 +22,8 @@ training:
   
   # Early stopping
   early_stopping:
-    enabled: true
-    patience: 2
+    enabled: true    
+    patience: 3
     min_delta: 0.001
     metric: "val_f1"
     mode: "max"
@@ -52,18 +50,17 @@ data:
   num_workers: 0
 
 preprocessing:
-  # Text preprocessing options (lighter for Twitter model)
-  lowercase: false  # Keep original case for Twitter model
-  remove_urls: false  # Keep URLs as they may carry sentiment
-  remove_mentions: false  # Keep mentions
-  remove_hashtags: false  # Keep hashtags
+  # Text preprocessing options (lighter for Twitter model)  
+  lowercase: true
+  remove_urls: true
+  remove_mentions: false
+  remove_hashtags: false
   remove_extra_whitespace: true
   remove_stopwords: false
-  expand_contractions: false  # Keep contractions as they appear in tweets
+  expand_contractions: true
   
   # Emoji handling
-  emoji_handling: "keep"  # Keep emojis for Twitter model
-  
+  emoji_handling: "convert"
   # Special tokens
   add_special_tokens: true
 
